@@ -1,0 +1,5 @@
+# Runtime: Python 3.10+ standard library only.
+# No third-party Python packages are required.
+# Codex CLI is installed separately and must be available in PATH for index rebuilding.
+# Currently supports macOS/Linux (uses POSIX fcntl).
+# Optional browser-test dependencies are declared in package.json.

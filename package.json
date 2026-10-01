@@ -1,0 +1,16 @@
+{
+  "name": "codex-history-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Codex JSONL and SQLite history manager",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test:transcript": "node test_transcript.cjs",
+    "test:browser": "node test_browser.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

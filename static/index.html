@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="本地 JSONL 文件编辑器，支持逐条编辑、校验和保存到原文件。">
+  <title>Codex 聊天工作台</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23171b20'/%3E%3Cpath d='M12 7H9v7l-3 2 3 2v7h3m8-18h3v7l3 2-3 2v7h-3' fill='none' stroke='%236be4bd' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./style.css">
+  <script src="./lucide.min.js" defer></script>
+  <script src="./marked.umd.js" defer></script>
+  <script src="./transcript.js" defer></script>
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand"><span class="brand-icon"><i data-lucide="database"></i></span><h1>Codex <span>聊天工作台</span></h1></div>
+    <div class="local-label"><i data-lucide="hard-drive"></i><span id="connection-label">连接本机...</span></div>
+    <button id="toggle-chats" class="icon-button" title="显示或隐藏聊天列表" aria-label="显示或隐藏聊天列表"><i data-lucide="panel-left"></i></button>
+    <button id="open" class="button" title="打开普通 JSONL 文件（不关联 SQLite）"><i data-lucide="folder-open"></i><span>打开文件</span></button>
+    <button id="save" class="button primary" disabled><i data-lucide="save"></i><span>保存原文件</span></button>
+    <button id="save-as" class="icon-button" title="另存为" aria-label="另存为" disabled><i data-lucide="download"></i></button>
+  </header>
+  <div class="file-bar">
+    <div class="filename"><i data-lucide="file-json"></i><span id="filename">未打开文件</span><span id="dirty" hidden>未保存</span></div>
+    <button id="open-parent" class="icon-button" title="打开继承历史的父聊天" aria-label="打开继承历史的父聊天" hidden><i data-lucide="git-fork"></i></button>
+    <button id="copy-backup" class="icon-button" title="复制最近一次备份路径" aria-label="复制最近一次备份路径" hidden><i data-lucide="folder-clock"></i></button>
+    <span id="file-meta">UTF-8 · JSON Lines</span>
+  </div>
+  <div class="sync-bar" id="sync-bar">
+    <div class="workspace-tabs" role="tablist" aria-label="数据视图">
+      <button id="conversation-mode" role="tab" aria-selected="true"><i data-lucide="messages-square"></i>对话</button>
+      <button id="jsonl-mode" role="tab" aria-selected="false"><i data-lucide="file-json"></i>原始数据</button>
+      <button id="sqlite-mode" role="tab" aria-selected="false" disabled><i data-lucide="database"></i>SQLite</button>
+    </div>
+    <div class="sync-controls"><span id="index-health" class="health">未选择聊天</span>
+    <span id="index-offset" class="index-offset"></span>
+    <label class="linked-toggle" title="保存时联动同 ID 的单段文本消息副本及删除；不改其他事件"><input id="mirror-messages" type="checkbox" checked><span>关联消息</span></label>
+    <button id="reload-chat" class="icon-button" title="重新读取聊天和 SQLite" aria-label="重新读取聊天和 SQLite" disabled><i data-lucide="refresh-cw"></i></button>
+    <button id="repair-index" class="icon-button" title="按当前磁盘 JSONL 重建索引" aria-label="按当前磁盘 JSONL 重建索引" disabled><i data-lucide="wrench"></i></button>
+    </div>
+  </div>
+  <div class="workspace">
+  <aside id="chats-panel" class="chats-panel">
+    <div class="panel-heading"><h2>项目</h2><span id="chat-total" class="count">0</span><div class="project-controls"><button id="expand-all-projects" class="icon-button" title="展开全部项目" aria-label="展开全部项目"><i data-lucide="chevrons-up-down"></i></button><button id="collapse-all-projects" class="icon-button" title="收起全部项目" aria-label="收起全部项目"><i data-lucide="chevrons-down-up"></i></button><button id="refresh-chats" class="icon-button" title="刷新项目和聊天" aria-label="刷新项目和聊天"><i data-lucide="refresh-cw"></i></button></div></div>
+    <label class="search"><i data-lucide="search"></i><input id="chat-search" placeholder="标题、ID、项目..." aria-label="搜索聊天"></label>
+    <div id="project-search-scope" class="project-search-scope" hidden><i data-lucide="folder-search"></i><span id="project-search-name"></span><button id="clear-project-scope" class="icon-button" title="退出项目内搜索" aria-label="退出项目内搜索"><i data-lucide="x"></i></button></div>
+    <div id="chat-list" class="chat-list" aria-label="项目和聊天目录"></div>
+    <button id="show-ignored-projects" class="sidebar-ignored"><i data-lucide="eye-off"></i><span>已忽略项目</span><span id="ignored-project-count" class="count">0</span></button>
+  </aside>
+  <section id="ignored-workspace" class="ignored-workspace" hidden>
+    <div class="ignored-toolbar"><button id="ignored-back" class="icon-button" title="返回上一视图" aria-label="返回上一视图"><i data-lucide="arrow-left"></i></button><h2>已忽略项目</h2><span id="ignored-total">0 个项目</span><button id="restore-all-projects" class="button" title="恢复全部已忽略项目"><i data-lucide="rotate-ccw"></i>全部恢复</button></div>
+    <label class="search ignored-search"><i data-lucide="search"></i><input id="ignored-search" placeholder="搜索已忽略项目..." aria-label="搜索已忽略项目"></label>
+    <div id="ignored-project-list" class="ignored-project-list"></div>
+  </section>
+  <section id="conversation-workspace" class="conversation-workspace">
+    <div class="conversation-toolbar"><button id="toggle-prompts" class="icon-button" title="显示或隐藏我的发言导航" aria-label="显示或隐藏我的发言导航"><i data-lucide="list"></i></button><h2 id="conversation-title">对话</h2><span id="conversation-count">0 条消息</span><button id="conversation-top" class="icon-button" title="回到对话开头" aria-label="回到对话开头"><i data-lucide="arrow-up-to-line"></i></button><button id="conversation-bottom" class="icon-button" title="跳到对话末尾" aria-label="跳到对话末尾"><i data-lucide="arrow-down-to-line"></i></button></div>
+    <div class="conversation-body">
+      <aside id="prompt-nav" class="prompt-nav"><div class="panel-heading"><h2>我的发言</h2><span id="prompt-count" class="count">0</span></div><label class="search"><i data-lucide="search"></i><input id="prompt-search" placeholder="搜索我的发言..." aria-label="搜索我的发言"></label><div id="prompt-list" class="prompt-list"></div></aside>
+      <div id="conversation-scroll" class="conversation-scroll"><div id="conversation-empty" class="list-empty">选择一条聊天</div><div id="message-log" class="message-log"></div></div>
+      <nav id="prompt-rail" class="prompt-rail" aria-label="发言快速跳转"></nav>
+    </div>
+  </section>
+  <main id="jsonl-workspace" hidden>
+    <aside class="records-panel">
+      <div class="panel-heading"><h2>记录</h2><span id="count" class="count">0</span><button id="add" class="icon-button" title="添加记录" aria-label="添加记录" disabled><i data-lucide="plus"></i></button></div>
+      <label class="search"><i data-lucide="search"></i><input id="search" placeholder="搜索记录..." aria-label="搜索记录" disabled><button id="clear-search" class="icon-button" title="清除搜索" aria-label="清除搜索" hidden><i data-lucide="x"></i></button></label>
+      <label class="type-filter"><span>type</span><select id="type-filter" aria-label="按 type 筛选" disabled><option value="">全部类型</option></select></label>
+      <div class="filter-row"><span id="list-count">全部记录</span><label><input id="errors-only" type="checkbox" disabled>仅错误</label></div>
+      <div class="selection-bar"><label><input id="select-page" type="checkbox" disabled>本页全选</label><div class="selection-actions"><span id="checked-count">已选 0</span><button id="clear-checked" class="icon-button" title="取消全部勾选" aria-label="取消全部勾选" disabled><i data-lucide="x"></i></button><button id="delete-checked" class="icon-button danger" title="删除勾选记录" aria-label="删除勾选记录" disabled><i data-lucide="trash-2"></i></button></div></div>
+      <div id="records" class="record-list" role="list" aria-label="JSONL 记录"></div>
+      <div class="pagination"><button id="prev" class="icon-button" title="上一页" aria-label="上一页" disabled><i data-lucide="chevron-left"></i></button><form id="page-jump" class="page-jump"><input id="page-number" type="number" min="1" step="1" value="1" aria-label="跳转页码" disabled><span id="page">/ 0</span><button id="jump" class="icon-button" title="跳转到指定页" aria-label="跳转到指定页" disabled><i data-lucide="corner-down-left"></i></button></form><button id="next" class="icon-button" title="下一页" aria-label="下一页" disabled><i data-lucide="chevron-right"></i></button></div>
+    </aside>
+    <section class="editor-panel">
+      <div class="editor-toolbar">
+        <div class="tabs" role="tablist" aria-label="编辑视图"><button id="record-tab" role="tab" aria-selected="true">单条记录</button><button id="source-tab" role="tab" aria-selected="false">完整文件</button></div>
+        <span id="selection-label"></span>
+        <div class="editor-actions"><button id="format" class="icon-button" title="格式化当前内容" aria-label="格式化当前内容" disabled><i data-lucide="align-left"></i></button><button id="undo" class="icon-button" title="撤销" aria-label="撤销" disabled><i data-lucide="undo-2"></i></button><button id="redo" class="icon-button" title="重做" aria-label="重做" disabled><i data-lucide="redo-2"></i></button><span class="divider"></span><button id="delete" class="icon-button danger" title="删除记录" aria-label="删除记录" disabled><i data-lucide="trash-2"></i></button><button id="delete-after" class="icon-button danger" title="删除当前记录之后的所有记录（保留当前记录）" aria-label="删除后续所有记录" disabled><i data-lucide="list-x"></i></button></div>
+      </div>
+      <div id="empty" class="empty">
+        <span class="empty-icon"><i data-lucide="file-json-2"></i></span>
+        <h2>选择一条聊天</h2>
+        <button id="empty-open" class="button primary"><i data-lucide="folder-open"></i>选择文件</button>
+        <button id="new" class="text-button"><i data-lucide="plus"></i>新建文件</button>
+      </div>
+      <div id="editor-wrap" class="editor-wrap" hidden><div id="gutter" class="gutter" aria-hidden="true"></div><textarea id="editor" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" aria-label="JSON 编辑区" wrap="off"></textarea></div>
+      <div id="validation" class="validation" hidden><i data-lucide="circle-alert"></i><span id="validation-text"></span></div>
+      <div class="editor-bottom"><span id="cursor">Ln 1, Col 1</span><span id="view-meta">JSON</span></div>
+    </section>
+  </main>
+  <section id="sqlite-workspace" class="sqlite-workspace" hidden>
+    <div class="db-toolbar">
+      <label>数据表 <select id="db-table" aria-label="SQLite 数据表">
+        <option value="threads">threads</option>
+        <option value="thread_turns">thread_turns</option>
+        <option value="thread_items">thread_items</option>
+        <option value="thread_history_projection_state">thread_history_projection_state</option>
+        <option value="thread_realtime_items">thread_realtime_items</option>
+      </select></label>
+      <span id="db-count">0 行</span><button id="refresh-table" class="icon-button" title="刷新数据表" aria-label="刷新数据表"><i data-lucide="refresh-cw"></i></button>
+    </div>
+    <div class="db-content">
+      <div class="db-grid-wrap"><table id="db-grid"><thead></thead><tbody></tbody></table><div id="db-empty" class="list-empty" hidden>此聊天在该表中暂无数据</div></div>
+      <section class="db-detail"><div class="panel-heading"><h2>行数据</h2><button id="locate-event" class="icon-button" title="定位对应 JSONL 事件" aria-label="定位对应 JSONL 事件" disabled><i data-lucide="arrow-up-right"></i></button><button id="copy-db-row" class="icon-button" title="复制行数据" aria-label="复制行数据" disabled><i data-lucide="copy"></i></button></div><pre id="db-row-detail">未选择数据行</pre></section>
+    </div>
+    <div class="db-pagination"><span id="db-source"></span><button id="db-prev" class="icon-button" title="上一页数据" aria-label="上一页数据"><i data-lucide="chevron-left"></i></button><span id="db-page">0 / 0</span><button id="db-next" class="icon-button" title="下一页数据" aria-label="下一页数据"><i data-lucide="chevron-right"></i></button></div>
+  </section>
+  </div>
+  <footer><span id="status"><span class="status-dot"></span>就绪</span><div><span id="summary">0 条记录</span><span class="footer-separator">|</span><span id="save-status">未打开文件</span></div></footer>
+  <input id="file-input" type="file" accept=".jsonl,.ndjson,.json,.txt" hidden>
+  <div id="toast" role="status" hidden></div>
+  <div id="project-context-menu" class="project-context-menu" role="menu" aria-label="项目菜单" hidden>
+    <button id="project-menu-expand" role="menuitem"><i data-lucide="chevron-down"></i>展开</button>
+    <button id="project-menu-collapse" role="menuitem"><i data-lucide="chevron-right"></i>折叠</button>
+    <button id="project-menu-ignore" role="menuitem"><i data-lucide="eye-off"></i>忽略</button>
+    <button id="project-menu-search" role="menuitem"><i data-lucide="search"></i>项目内搜索</button>
+  </div>
+  <div id="prompt-hover" class="prompt-hover" role="dialog" aria-label="发言预览" hidden><div id="prompt-hover-meta"></div><p id="prompt-hover-text"></p><blockquote id="prompt-hover-reply" hidden></blockquote><div class="prompt-hover-actions"><button id="prompt-hover-jump" class="icon-button" title="跳转到这条发言" aria-label="跳转到这条发言"><i data-lucide="arrow-down"></i></button><button id="prompt-hover-source" class="icon-button" title="定位这条发言的原始数据" aria-label="定位这条发言的原始数据"><i data-lucide="file-code-2"></i></button></div></div>
+  <dialog id="confirm-dialog"><form method="dialog"><h2 id="dialog-title"></h2><p id="dialog-message"></p><div class="dialog-actions"><button class="button" value="cancel">取消</button><button id="dialog-confirm" class="button primary" value="confirm">继续</button></div></form></dialog>
+</body>
+</html>
