@@ -90,6 +90,96 @@
   function escapeHtml(text) {
     return String(text).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
   }
+  function textReference(record) {
+    const payload = record?.payload;
+    if (!payload || typeof payload !== 'object') return null;
+    let target, role, property;
+    if (record.type === 'event_msg' && ['AgentMessage', 'UserMessage'].includes(payload.item?.type)) {
+      target = payload.item; role = target.type === 'AgentMessage' ? 'assistant' : 'user';
+    } else if (record.type === 'response_item' && payload.type === 'message' && ['assistant', 'user'].includes(payload.role)) {
+      target = payload; role = target.role;
+    } else if (record.type === 'event_msg' && ['agent_message', 'user_message'].includes(payload.type)) {
+      target = payload; role = payload.type === 'agent_message' ? 'assistant' : 'user'; property = 'message';
+    } else return null;
+    if (!property) property = typeof target.text === 'string' && !target.content ? 'text' : 'content';
+    const value = target[property];
+    const text = typeof value === 'string' ? value : Array.isArray(value) ? value.map((part) =>
+      typeof part === 'string' ? part : typeof part?.text === 'string' ? part.text : '').filter(Boolean).join('\n') : '';
+    return { target, role, id: target.id || null, property, text,
+      turn: payload.turn_id || payload.internal_chat_message_metadata_passthrough?.turn_id || '',
+      phase: target.phase || payload.phase || payload.channel || '' };
+  }
+  function editableText(rows, message) {
+    const reference = textReference(rows[message.rowIndex]?.value);
+    if (!reference) throw new Error('此消息没有可编辑的文本记录。');
+    return displayText(reference.text) !== reference.text.trim() ? displayText(reference.text) : reference.text;
+  }
+  function replaceReferenceText(reference, text) {
+    const raw = reference.text;
+    if (displayText(raw) !== raw.trim()) {
+      const start = raw.indexOf('## My request:') + '## My request:'.length;
+      const tail = raw.slice(start), leading = tail.match(/^\s*/)[0], trailing = tail.match(/\s*$/)[0];
+      text = raw.slice(0, start) + leading + text + trailing;
+    }
+    const value = reference.target[reference.property];
+    if (typeof value === 'string') reference.target[reference.property] = text;
+    else if (Array.isArray(value)) {
+      let replaced = false;
+      reference.target[reference.property] = value.map((part) => {
+        if (typeof part === 'string') { const next = replaced ? '' : text; replaced = true; return next; }
+        if (typeof part?.text === 'string') { const next = { ...part, text: replaced ? '' : text }; replaced = true; return next; }
+        return part;
+      });
+      if (!replaced) throw new Error('此消息仅有附件，请在原始数据中处理。');
+    } else throw new Error('不支持的消息内容结构。');
+  }
+  function editMessage(rows, message, text, mirror = true) {
+    if (typeof text !== 'string' || !text.trim()) throw new Error('消息文本不能为空；删除记录请使用原始数据视图。');
+    const canonical = textReference(rows[message.rowIndex]?.value);
+    if (!canonical) throw new Error('原始消息已发生变化。');
+    const aliases = new Set(mirror ? message.sourceRows : [message.rowIndex]);
+    const ids = new Set();
+    for (const index of aliases) {
+      const ref = textReference(rows[index]?.value);
+      if (!ref || ref.role !== message.role) continue;
+      if (ref.id && ref.id !== canonical.id && ref.text.trim() !== canonical.text.trim()) throw new Error('关联副本文本不一致，请先在原始数据中确认。');
+      if (ref.id) ids.add(ref.id);
+    }
+    const updates = new Map(), candidates = new Set();
+    let turn = '', lastAssistant = new Map();
+    for (let index = 0; index < rows.length; index++) {
+      const record = rows[index].value;
+      if (!record?.payload) continue;
+      const payload = record.payload;
+      if (record.type === 'event_msg' && payload.type === 'task_started') turn = payload.turn_id || '';
+      const ref = textReference(record), currentTurn = ref?.turn || payload.turn_id || turn;
+      if (ref && ref.phase !== 'analysis') {
+        const sameTurn = !message.turn || currentTurn === message.turn;
+        const matches = ref.role === message.role && sameTurn &&
+          (aliases.has(index) || (mirror && ref.id && ids.has(ref.id)));
+        if (matches) {
+          const copy = JSON.parse(JSON.stringify(record));
+          replaceReferenceText(textReference(copy), text);
+          candidates.add(index);
+          if (JSON.stringify(copy) !== JSON.stringify(record)) updates.set(index, copy);
+        }
+        if (ref.role === 'assistant' && ref.text.trim() && payload.type !== 'item_started') {
+          lastAssistant.set(currentTurn, { ref, matches, index });
+        }
+      }
+      if (mirror && message.role === 'assistant' && record.type === 'event_msg' &&
+          payload.type === 'task_complete' && typeof payload.last_agent_message === 'string') {
+        const last = lastAssistant.get(currentTurn);
+        if (last?.matches && payload.last_agent_message.trim() === last.ref.text.trim()) {
+          const copy = JSON.parse(JSON.stringify(record)); copy.payload.last_agent_message = text;
+          candidates.add(index);
+          if (payload.last_agent_message !== text) updates.set(index, copy);
+        }
+      }
+    }
+    if (!candidates.has(message.rowIndex)) throw new Error('无法确认消息的原始位置。');
+    return { updates, relatedCount: candidates.size };
+  }
   function markdown(text, library) {
     const renderer = new library.Renderer();
     renderer.html = ({ text }) => escapeHtml(text);
@@ -104,5 +194,5 @@
     };
     return library.parse(text, { renderer, gfm: true, breaks: true, async: false });
   }
-  return { readMessages, displayText, markdown };
+  return { readMessages, displayText, markdown, editableText, editMessage };
 });

@@ -79,10 +79,35 @@ def message_reference(record):
     return (message["id"], role), content[0]
 
 
+def assistant_summary_references(records):
+    current_turn = ""
+    last = {}
+    links = {}
+    for index, record in enumerate(records):
+        payload = record.get("payload", {})
+        if record.get("type") == "event_msg" and payload.get("type") == "task_started":
+            current_turn = payload.get("turn_id", "")
+        turn = payload.get("turn_id") or payload.get(
+            "internal_chat_message_metadata_passthrough", {}).get("turn_id") or current_turn
+        reference = message_reference(record)
+        if (reference and reference[0][1] == "assistant" and reference[1]["text"].strip()
+                and payload.get("type") != "item_started"
+                and payload.get("channel") != "analysis"):
+            last[turn] = (reference[0], reference[1]["text"])
+        if (record.get("type") == "event_msg" and payload.get("type") == "task_complete"
+                and isinstance(payload.get("last_agent_message"), str) and turn in last):
+            key, text = last[turn]
+            if payload["last_agent_message"].strip() == text.strip():
+                links[turn] = (key, payload["last_agent_message"])
+    return links
+
+
 def linked_messages(source, original):
     """Mirror changed/deleted plain-text messages across their persisted representations."""
     old = {}
-    for record in map(json.loads, jsonl_lines(original)):
+    original_records = [json.loads(line) for line in jsonl_lines(original)]
+    summary_links = assistant_summary_references(original_records)
+    for record in original_records:
         reference = message_reference(record)
         if reference:
             key, content = reference
@@ -97,6 +122,7 @@ def linked_messages(source, original):
             groups.setdefault(key, []).append((index, content))
     modified = set()
     deleted = set()
+    changed_texts = {}
     for key, original_texts in old.items():
         current = groups.get(key, [])
         if len(current) < len(original_texts):
@@ -107,10 +133,24 @@ def linked_messages(source, original):
             raise StoreError(f"消息 {key[0]} 的多个副本文本冲突，请先统一文本。")
         if changes:
             text = changes.pop()
+            changed_texts[key] = text
             for index, content in current:
                 if content["text"] != text:
                     content["text"] = text
                     modified.add(index)
+    for index, record in enumerate(records):
+        payload = record.get("payload", {})
+        if record.get("type") != "event_msg" or payload.get("type") != "task_complete":
+            continue
+        link = summary_links.get(payload.get("turn_id", ""))
+        if not link or link[0] not in changed_texts:
+            continue
+        text = changed_texts[link[0]]
+        if payload.get("last_agent_message") == link[1]:
+            payload["last_agent_message"] = text
+            modified.add(index)
+        elif payload.get("last_agent_message") != text:
+            raise StoreError("完成事件摘要与消息修改冲突，请先确认关联文本。")
     result = []
     for index, record in enumerate(records):
         if index in deleted:

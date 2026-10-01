@@ -192,7 +192,8 @@ class StoreTests(unittest.TestCase):
         opened = self.store.open(THREAD)
         self.records[4]["payload"]["content"][0]["text"] = "response-only edit"
         saved = self.store.save(THREAD, opened["version"], self.serialize(self.records))
-        self.assertEqual(saved["linkedChanges"], 1)
+        self.assertEqual(saved["linkedChanges"], 2)
+        self.assertEqual(json.loads(saved["source"].splitlines()[-1])["payload"]["last_agent_message"], "response-only edit")
         rows = self.store.table(THREAD, "thread_items")["rows"]
         item = next(json.loads(row["item_json"]) for row in rows if row["item_id"] == "agent-one")
         self.assertEqual(item["text"], "response-only edit")
@@ -210,6 +211,14 @@ class StoreTests(unittest.TestCase):
         self.assertIn("original answer", saved["source"])
         self.assertIn("only this row", saved["source"])
         self.assertEqual(saved["linkedChanges"], 0)
+
+    def test_summary_mirror_conflict_rejected(self):
+        opened = self.store.open(THREAD)
+        self.records[4]["payload"]["content"][0]["text"] = "changed answer"
+        self.records[5]["payload"]["last_agent_message"] = "different summary"
+        with self.assertRaisesRegex(StoreError, "摘要与消息修改冲突"):
+            self.store.save(THREAD, opened["version"], self.serialize(self.records))
+        self.assertEqual(self.path.read_text(), opened["source"])
 
     def test_unicode_line_separator_inside_json_string(self):
         opened = self.store.open(THREAD)

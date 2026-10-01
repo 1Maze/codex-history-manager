@@ -77,7 +77,7 @@ with tempfile.TemporaryDirectory(prefix="chat-sync-browser-") as temporary:
     await page.fill('#editor', JSON.stringify(value, null, 2));
     await page.click('#save'); await page.click('#dialog-confirm');
     await page.waitForFunction(() => !state.busy && state.baseline.includes('浏览器同步修改') && !dirty());
-    assert.match(await page.textContent('#toast'), /联动 1 条/);
+    assert.match(await page.textContent('#toast'), /联动 2 条/);
     await page.click('#sqlite-mode');
     await page.selectOption('#db-table', 'thread_items');
     await page.waitForFunction(() => document.querySelector('#db-count').textContent === '2 行');

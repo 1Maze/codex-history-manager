@@ -9,14 +9,15 @@ const local = { token: '', tableOffset: 0, mode: 'conversation', row: null, chat
   groups: [], expanded: new Set(), groupsInitialized: false, searchCollapsed: new Set(), sidebarQuery: '',
   projectOrder: [], projectDrag: null, projectLimits: new Map(), loadingProjects: new Map(),
   ignoredProjects: new Map(), searchScope: null, menuProject: null, menuAnchor: null, lastDataMode: 'conversation' };
-const transcript = { source: null, inheritedRef: null, messages: [], prompts: [], expanded: new Set(), active: '', hover: null, observer: null };
+const transcript = { source: null, inheritedRef: null, messages: [], prompts: [], expanded: new Set(), active: '', hover: null, observer: null, edit: null };
 let toastTimer, inputTimer;
 function icons() { window.lucide?.createIcons(); }
 function toast(message) {
   $('toast').textContent = message; $('toast').hidden = false;
   clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 5000);
 }
-function dirty() { return state.draft !== null || state.source !== state.baseline; }
+function dirty() { return state.draft !== null || state.source !== state.baseline ||
+  !!(transcript.edit && transcript.edit.value !== transcript.edit.originalValue); }
 function splitSource(text) {
   const rows = []; const linePattern = /([^\r\n]*)(\r\n|\r|\n|$)/g;
   let match;
@@ -52,6 +53,7 @@ function currentError() {
   return errors.length ? `第 ${errors[0].line} 行：${errors[0].error}（共 ${errors.length} 行错误）` : null;
 }
 function finishDraft() {
+  if (transcript.edit && !applyMessageEdit(false)) return false;
   clearTimeout(inputTimer);
   if (state.view !== 'record' || state.draft === null) return true;
   let value;
@@ -249,6 +251,7 @@ async function readFile(file, handle = null, sync = null) {
   state.version = { size: file.size, modified: file.lastModified };
   $('search').value = ''; $('errors-only').checked = false; $('clear-search').hidden = true;
   transcript.source = null; transcript.expanded.clear(); transcript.active = ''; $('prompt-search').value = '';
+  transcript.edit = null;
   $('conversation-scroll').scrollTop = 0;
   if (innerWidth < 850) $('prompt-nav').classList.add('collapsed');
   applySource(text, 0, false); render();
@@ -517,6 +520,45 @@ function currentTranscriptMessage(message) {
   return transcript.messages.find((item) => item.key === message.key ||
     (message.recordId && item.recordId === message.recordId && item.sourceThreadId === message.sourceThreadId)) || null;
 }
+async function startMessageEdit(message) {
+  let current = currentTranscriptMessage(message);
+  if (!current) return;
+  if (current.inherited && current.sourceThreadId !== state.sync?.id) {
+    if (!await confirmAction('编辑父会话中的消息？',
+      '此消息来自父会话。修改可能影响继承此段历史的分支，且不会自动修改分支的继承边界。继续打开父会话编辑？', '打开父会话')) return;
+    const id = current.recordId, key = current.key, owner = current.sourceThreadId;
+    await openChat(owner);
+    if (state.sync?.id !== owner) return;
+    current = transcript.messages.find((item) => item.sourceThreadId === owner && (id ? item.recordId === id : item.key === key));
+    if (!current) { toast('父会话中的消息已发生变化。'); return; }
+  }
+  try {
+    const value = window.ChatTranscript.editableText(state.rows, current);
+    const plan = window.ChatTranscript.editMessage(state.rows, current, value, $('mirror-messages').checked);
+    transcript.edit = { message: current, originalValue: value, value, relatedCount: plan.relatedCount, source: state.source };
+    transcript.source = null; renderConversation(); renderStatus();
+    const editor = $('message-log').querySelector('.message-textarea');
+    editor?.focus({ preventScroll: true });
+  } catch (error) { toast(`无法编辑消息：${error.message}`); }
+}
+function applyMessageEdit() {
+  const edit = transcript.edit;
+  if (!edit) return true;
+  try {
+    if (state.source !== edit.source) throw new Error('原始草稿在编辑期间发生变化，请取消后重新编辑。');
+    const plan = window.ChatTranscript.editMessage(state.rows, edit.message, edit.value, $('mirror-messages').checked);
+    const rows = state.rows.map((row, index) => plan.updates.has(index) ?
+      { ...row, raw: JSON.stringify(plan.updates.get(index)) } : row);
+    transcript.edit = null;
+    applySource(textFromRows(rows), state.selected);
+    transcript.source = null;
+    render();
+    return true;
+  } catch (error) { toast(`消息修改未应用：${error.message}`); return false; }
+}
+function cancelMessageEdit() {
+  transcript.edit = null; transcript.source = null; render();
+}
 async function locateMessageSource(message) {
   let current = currentTranscriptMessage(message);
   if (!current) { if (!state.busy) toast('该消息已不在当前草稿中。'); return; }
@@ -624,8 +666,26 @@ function renderConversation() {
     const actions = document.createElement('div'); actions.className = 'message-actions';
     actions.append(messageButton('copy', `复制第 ${index + 1} 条消息`, async () => {
       try { await navigator.clipboard.writeText(message.text); toast('消息已复制。'); } catch { toast('无法访问剪贴板。'); }
-    }), messageButton('file-code-2', `查看第 ${index + 1} 条消息的原始数据`, () => locateMessageSource(message)));
+    }), messageButton('pencil', `编辑第 ${index + 1} 条消息`, () => startMessageEdit(message)),
+    messageButton('file-code-2', `查看第 ${index + 1} 条消息的原始数据`, () => locateMessageSource(message)));
     meta.append(actions);
+    if (transcript.edit?.message.key === message.key) {
+      article.classList.add('is-editing'); article.append(meta);
+      const editor = document.createElement('textarea'); editor.className = 'message-textarea';
+      editor.setAttribute('aria-label', '编辑消息文本'); editor.spellcheck = false; editor.wrap = 'soft';
+      editor.value = transcript.edit.value;
+      editor.oninput = () => { if (transcript.edit) { transcript.edit.value = editor.value; renderStatus(); } };
+      const controls = document.createElement('div'); controls.className = 'message-edit-controls';
+      const count = document.createElement('span'); count.textContent = `${transcript.edit.relatedCount} 条关联记录`;
+      const cancel = document.createElement('button'); cancel.className = 'button'; cancel.textContent = '取消';
+      cancel.onclick = cancelMessageEdit;
+      const save = document.createElement('button'); save.className = 'button primary';
+      const icon = document.createElement('i'); icon.dataset.lucide = 'save';
+      const label = document.createElement('span'); label.textContent = '保存修改'; save.append(icon, label);
+      save.onclick = async () => { if (!state.busy && applyMessageEdit()) await saveFile(); };
+      controls.append(count, cancel, save); article.append(editor, controls); fragment.append(article);
+      continue;
+    }
     const content = document.createElement('div'); content.className = 'message-markdown';
     const limit = message.role === 'user' ? 900 : 1600;
     const updateContent = () => {

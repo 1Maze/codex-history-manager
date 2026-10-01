@@ -95,6 +95,11 @@ body.sorting-projects,body.sorting-projects button{cursor:grabbing!important}
 .message-actions{margin-left:auto;display:flex;align-items:center;gap:2px;opacity:.35}
 .conversation-message:hover .message-actions,.message-actions:focus-within{opacity:1}
 .message-actions .icon-button{width:26px;height:26px}.message-actions svg{width:15px;height:15px}
+.conversation-message.user.is-editing{width:100%;max-width:100%}
+.message-textarea{display:block;flex:none;width:100%;height:230px;min-height:150px;max-height:60dvh;resize:vertical;border:1px solid #d6e0db;border-radius:5px;padding:12px;background:white;white-space:pre-wrap;font:13px/1.8 ui-monospace,SFMono-Regular,monospace}
+.message-edit-controls{display:flex;align-items:center;gap:8px;margin-top:10px}
+.message-edit-controls>span{margin-right:auto;font-size:12px;color:#88949c}
+@media(max-width:600px){.message-edit-controls{flex-wrap:wrap}.message-edit-controls>span{width:100%}.message-textarea{height:210px}}
 .message-markdown{font-size:14px;line-height:1.85;color:#303943;overflow-wrap:anywhere;min-width:0}
 .message-markdown p{margin:0 0 12px}.message-markdown p:last-child{margin-bottom:0}
 .message-markdown h1{font-size:20px}.message-markdown h2{font-size:18px}.message-markdown h3{font-size:16px}
