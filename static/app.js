@@ -8,7 +8,8 @@ const state = {
 const local = { token: '', tableOffset: 0, mode: 'conversation', row: null, chatRequest: 0, tableRequest: 0,
   groups: [], expanded: new Set(), groupsInitialized: false, searchCollapsed: new Set(), sidebarQuery: '',
   projectOrder: [], projectDrag: null, projectLimits: new Map(), loadingProjects: new Map(),
-  ignoredProjects: new Map(), searchScope: null, menuProject: null, menuAnchor: null, lastDataMode: 'conversation' };
+  ignoredProjects: new Map(), searchScope: null, menuProject: null, menuAnchor: null, lastDataMode: 'conversation',
+  recoveryPlan: null, recoveryDraft: null, backupRequest: 0 };
 const transcript = { source: null, inheritedRef: null, messages: [], prompts: [], expanded: new Set(), active: '', hover: null, observer: null, edit: null };
 let toastTimer, inputTimer;
 function icons() { window.lucide?.createIcons(); }
@@ -184,10 +185,21 @@ function renderStatus() {
   $('save').disabled = !state.opened || state.busy;
   $('save').querySelector('span').textContent = state.sync ? '同步保存' : state.handle ? '保存原文件' : '选择位置保存';
   $('save-as').disabled = !state.opened || state.busy;
+  $('manual-backup').disabled = $('backup-current').disabled = !state.sync || state.busy;
+  $('preview-recovery').disabled = !state.sync || state.busy || dirty();
+  $('open-backups').disabled = $('recovery-mode').disabled = state.busy;
+  $('create-recovery-copy').disabled = state.busy || !local.recoveryPlan?.selectedTurns ||
+    Number($('recovery-keep').value) !== local.recoveryPlan?.keep;
+  $('export-handoff').disabled = state.busy || !local.recoveryPlan;
+  $('recovery-handoff').readOnly = state.busy || $('recovery-copy-mode').value !== 'handoff';
+  $('recovery-copy-mode').disabled = state.busy;
+  $('recovery-keep').disabled = state.busy;
+  $('backup-list').querySelectorAll('button').forEach((button) => { button.disabled = state.busy || button.dataset.unavailable === 'true'; });
   $('open').disabled = state.busy; $('new').disabled = state.busy; $('empty-open').disabled = state.busy;
   $('add').disabled = !state.opened || state.busy;
   $('format').disabled = !state.opened || state.busy || (state.view === 'record' && state.selected < 0);
   $('delete').disabled = state.view !== 'record' || state.selected < 0 || state.busy;
+  $('delete-before').disabled = state.view !== 'record' || state.selected <= prefixDeletionStart() || state.busy;
   $('delete-after').disabled = state.view !== 'record' || state.selected < 0 || state.selected >= state.rows.length - 1 || state.busy;
   $('undo').disabled = (!state.undo.length && state.draft === null) || state.busy;
   $('redo').disabled = !state.redo.length || state.busy;
@@ -252,6 +264,8 @@ async function readFile(file, handle = null, sync = null) {
   $('search').value = ''; $('errors-only').checked = false; $('clear-search').hidden = true;
   transcript.source = null; transcript.expanded.clear(); transcript.active = ''; $('prompt-search').value = '';
   transcript.edit = null;
+  local.recoveryPlan = null;
+  local.recoveryDraft = null;
   $('conversation-scroll').scrollTop = 0;
   if (innerWidth < 850) $('prompt-nav').classList.add('collapsed');
   applySource(text, 0, false); render();
@@ -341,6 +355,21 @@ async function deleteAfter() {
   applySource(textFromRows(state.rows.slice(0, index + 1)), index);
   render(); toast(`已删除后续 ${count} 条记录，保留第 ${index + 1} 行，尚未保存到文件。`);
 }
+function prefixDeletionStart() {
+  return state.sync && state.rows[0]?.value?.type === 'session_meta' ? 1 : 0;
+}
+async function deleteBefore() {
+  if (state.busy || state.view !== 'record') return;
+  const index = state.selected, start = prefixDeletionStart(), count = index - start;
+  if (count <= 0) return;
+  const protectedHeader = start ? '首行 session_meta 会保留。删除任务上下文后，可能无法通过同步校验；校验失败不会写回。' : '';
+  if (!await confirmAction('删除之前所有记录？',
+    `保留第 ${index + 1} 行及之后的记录，删除原文件第 ${start + 1} 至 ${index} 行，共 ${count} 条。${protectedHeader}此操作不受搜索、type 或错误筛选影响。保存后才会写入原文件。`, `删除 ${count} 条`)) return;
+  if (!finishDraft()) return;
+  applySource(textFromRows([...state.rows.slice(0, start), ...state.rows.slice(index)]), start);
+  state.page = 0; render();
+  toast(`已删除之前 ${count} 条记录，保留当前记录及后续数据，尚未保存到文件。`);
+}
 async function deleteChecked() {
   if (!state.checked.size || state.busy) return;
   const targets = new Set(state.checked);
@@ -386,6 +415,7 @@ $('save').onclick = () => saveFile();
 $('save-as').onclick = () => saveFile(true);
 $('add').onclick = addRecord; $('delete').onclick = deleteRecord; $('format').onclick = formatContent;
 $('delete-after').onclick = deleteAfter;
+$('delete-before').onclick = deleteBefore;
 $('undo').onclick = () => history('undo'); $('redo').onclick = () => history('redo');
 for (const view of ['record', 'source']) {
   $(view + '-tab').onclick = () => {
@@ -498,14 +528,19 @@ function switchMode(mode) {
   closeProjectMenu();
   $('prompt-hover').hidden = true;
   $('ignored-workspace').hidden = mode !== 'ignored';
+  $('backup-workspace').hidden = mode !== 'backups';
+  $('recovery-workspace').hidden = mode !== 'recovery';
   $('conversation-workspace').hidden = mode !== 'conversation';
   $('jsonl-workspace').hidden = mode !== 'jsonl';
   $('sqlite-workspace').hidden = mode !== 'sqlite';
   $('jsonl-mode').setAttribute('aria-selected', String(mode === 'jsonl'));
   $('sqlite-mode').setAttribute('aria-selected', String(mode === 'sqlite'));
   $('conversation-mode').setAttribute('aria-selected', String(mode === 'conversation'));
+  $('recovery-mode').setAttribute('aria-selected', String(mode === 'recovery'));
   if (mode === 'conversation') renderConversation();
   if (mode === 'ignored') renderIgnoredProjects();
+  if (mode === 'backups') loadBackups();
+  if (mode === 'recovery') renderRecoveryPlan();
   $('show-ignored-projects').setAttribute('aria-current', String(mode === 'ignored'));
 }
 function messageButton(icon, label, action, className = '') {
@@ -513,6 +548,141 @@ function messageButton(icon, label, action, className = '') {
   button.title = label; button.setAttribute('aria-label', label);
   const graphic = document.createElement('i'); graphic.dataset.lucide = icon; button.append(graphic);
   button.onclick = action; return button;
+}
+async function backupCurrentSession() {
+  if (!state.sync || state.busy) return;
+  if (!await confirmAction('备份当前会话？', '备份磁盘上的 JSONL、关联数据库和继承记录。未保存的编辑不在这次备份内；不会修改会话。', '创建备份')) return;
+  state.busy = true; renderStatus();
+  try {
+    const result = await api('/api/backup', { id: state.sync.id });
+    state.sync.backup = result.backupPath;
+    toast('备份已完成。');
+    if (local.mode === 'backups') await loadBackups();
+  } catch (error) { toast(`备份失败：${error.message}`); }
+  finally { state.busy = false; renderStatus(); }
+}
+async function loadBackups() {
+  const request = ++local.backupRequest;
+  const parameters = new URLSearchParams();
+  if ($('backup-current-only').checked && state.sync) parameters.set('id', state.sync.id);
+  try {
+    const data = await api('/api/backups?' + parameters);
+    if (request !== local.backupRequest) return;
+    const fragment = document.createDocumentFragment();
+    for (const backup of data.rows) {
+      const row = document.createElement('div'); row.className = 'backup-row';
+      const details = document.createElement('div'); details.className = 'backup-details';
+      const title = document.createElement('strong'); title.textContent = backup.title || backup.threadId;
+      const meta = document.createElement('span');
+      const date = backup.createdAt && Number.isFinite(Date.parse(backup.createdAt)) ?
+        new Date(backup.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : backup.backupId;
+      meta.textContent = `${date} · ${(backup.fileBytes / 1024).toFixed(1)} KiB · ${backup.kind} · ${backup.status}`;
+      details.append(title, meta);
+      const location = messageButton('copy', '复制备份路径', async () => {
+        try { await navigator.clipboard.writeText(backup.backupPath); toast('备份路径已复制。'); } catch { toast('无法访问剪贴板。'); }
+      });
+      const restore = messageButton('rotate-ccw', `恢复备份 ${backup.backupId}`, () => restoreBackup(backup));
+      restore.dataset.backupId = backup.backupId; restore.dataset.unavailable = String(!backup.restorable);
+      restore.disabled = state.busy || !backup.restorable;
+      row.append(details, location, restore); fragment.append(row);
+    }
+    if (!data.rows.length) { const empty = document.createElement('div'); empty.className = 'list-empty'; empty.textContent = '暂无备份'; fragment.append(empty); }
+    $('backup-list').replaceChildren(fragment); icons();
+  } catch (error) { toast(`读取备份失败：${error.message}`); }
+}
+async function restoreBackup(backup) {
+  if (state.busy) return;
+  if (!state.sync || state.sync.id !== backup.threadId) {
+    await openChat(backup.threadId);
+    if (state.sync?.id !== backup.threadId) return;
+  }
+  if (dirty()) { toast('当前有未保存编辑，请先保存或重新读取后再恢复。'); return; }
+  if (!await confirmAction('恢复这条会话的历史？', '恢复备份的 JSONL 并重建该会话索引。恢复前会再次备份当前状态，不恢复其他会话。停止并关闭 Codex 中的目标会话后再操作。', '恢复备份')) return;
+  state.busy = true; renderStatus();
+  try {
+    const result = await api('/api/restore', { id: state.sync.id, version: state.sync.version, backupId: backup.backupId });
+    state.sync.version = result.version; state.sync.info = result.info; state.sync.inherited = result.inherited || [];
+    state.sync.backup = result.backup;
+    applySource(result.source, state.selected, false); state.baseline = result.source; state.draft = null;
+    transcript.source = null; local.recoveryPlan = null; local.recoveryDraft = null;
+    render(); toast('此会话已恢复，恢复前状态也已备份。'); await loadBackups();
+  } catch (error) { toast(`恢复失败：${error.message}`); }
+  finally { state.busy = false; renderStatus(); }
+}
+function renderRecoveryPlan() {
+  const plan = local.recoveryPlan;
+  $('recovery-stats').textContent = plan ?
+    `完整轮次 ${plan.completeTurns} · 保留 ${plan.selectedTurns} · 工具 ${plan.selectedToolCalls} 次 · 所选原始数据 ${(plan.selectedRawBytes / 1024).toFixed(1)} KiB` : '';
+  const fragment = document.createDocumentFragment();
+  for (const turn of plan?.turns || []) {
+    const row = document.createElement('div'); row.className = 'recovery-turn' + (turn.selected ? ' selected' : '');
+    const prompt = document.createElement('strong'); prompt.textContent = turn.prompt || '无用户文本';
+    const meta = document.createElement('span'); meta.textContent = `${turn.status === 'completed' ? '完整' : '未完成'} · ${turn.records} 条记录 · ${turn.messages} 条消息 · ${turn.toolCalls} 次工具 · ${(turn.bytes / 1024).toFixed(1)} KiB`;
+    row.append(prompt, meta); fragment.append(row);
+  }
+  $('recovery-turn-list').replaceChildren(fragment);
+  $('recovery-handoff').value = local.recoveryDraft ?? plan?.handoff ?? '';
+  const conversation = $('recovery-copy-mode').value === 'conversation';
+  $('recovery-handoff').hidden = conversation;
+  $('recovery-conversation').hidden = !conversation;
+  $('recovery-preview-label').textContent = conversation ? '所选对话' : '续聊文本';
+  $('handoff-bytes').textContent = conversation ? `${(plan?.selectedRawBytes || 0).toLocaleString()} B` :
+    `${new Blob([$('recovery-handoff').value]).size.toLocaleString()} B / 65,536 B`;
+  const messages = document.createDocumentFragment();
+  for (const item of plan?.conversation || []) {
+    const entry = document.createElement(item.role === 'tool' ? 'details' : 'article');
+    entry.className = 'recovery-message ' + item.role;
+    const heading = document.createElement(item.role === 'tool' ? 'summary' : 'strong');
+    heading.textContent = item.role === 'tool' ? item.name : item.role === 'user' ? '用户' : '助手';
+    const body = document.createElement(item.role === 'tool' ? 'pre' : 'div');
+    if (item.role === 'tool') body.textContent = item.text + (item.output ? '\n\n' + item.output : '');
+    else { body.className = 'message-markdown'; body.innerHTML = window.ChatTranscript.markdown(item.text, window.marked); }
+    entry.append(heading, body); messages.append(entry);
+  }
+  $('recovery-conversation').replaceChildren(messages);
+  $('create-recovery-copy').disabled = state.busy || !plan?.selectedTurns;
+  $('export-handoff').disabled = state.busy || !plan;
+}
+async function previewRecovery() {
+  if (!state.sync || state.busy) return;
+  if (dirty()) { toast('请先保存当前会话编辑，再生成恢复预览。'); return; }
+  if (local.recoveryPlan && local.recoveryDraft !== null && local.recoveryDraft !== local.recoveryPlan.handoff &&
+      !await confirmAction('重新生成续聊文本？', '将替换当前编辑的续聊文本。', '重新生成')) return;
+  state.busy = true; renderStatus();
+  try {
+    const result = await api('/api/recovery/preview', { id: state.sync.id, version: state.sync.version, keep: Number($('recovery-keep').value) });
+    local.recoveryPlan = result; local.recoveryDraft = result.handoff; renderRecoveryPlan();
+    if (!result.selectedTurns) toast('没有可选的完整轮次，可以导出模板手工整理。');
+  } catch (error) { toast(`恢复预览失败：${error.message}`); }
+  finally { state.busy = false; renderStatus(); }
+}
+async function createRecoveryCopy() {
+  if (!local.recoveryPlan || state.busy || !state.sync) return;
+  if (dirty()) { toast('请先保存当前会话编辑。'); return; }
+  if (Number($('recovery-keep').value) !== local.recoveryPlan.keep) { toast('轮次选择已变更，请重新生成预览。'); return; }
+  const mode = $('recovery-copy-mode').value;
+  const description = mode === 'conversation' ?
+    `保留 ${local.recoveryPlan.selectedTurns} 个完整轮次、${local.recoveryPlan.selectedToolCalls} 次工具调用及返回值，保持用户和助手角色。移除旧的压缩检查点，不继承更早历史。` :
+    '创建仅含当前续聊文本的一条用户消息，工具和推理记录不会复制。';
+  if (!await confirmAction('备份并创建独立副本？',
+    description + ' 原会话不会裁剪，创建前自动备份。未验证模型续聊。', '备份并创建')) return;
+  state.busy = true; renderStatus();
+  let created = null;
+  try {
+    created = await api('/api/recovery/create', { id: state.sync.id, version: local.recoveryPlan.version,
+      keep: Number($('recovery-keep').value), handoff: $('recovery-handoff').value, mode });
+    state.sync.backup = created.backupPath;
+    toast('独立副本已创建，原会话已备份且未裁剪。');
+  } catch (error) { toast(`创建恢复副本失败：${error.message}`); }
+  finally { state.busy = false; renderStatus(); }
+  if (created) { await refreshChats(); await openChat(created.threadId); }
+}
+function exportHandoff() {
+  const text = $('recovery-handoff').value;
+  if (!text) return;
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown;charset=utf-8' }));
+  const link = document.createElement('a'); link.href = url; link.download = 'codex-handoff.md'; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 function currentTranscriptMessage(message) {
   if (state.busy || !finishDraft()) return null;
@@ -1106,6 +1276,20 @@ $('toggle-chats').onclick = () => {
   $('chats-panel').classList.toggle('collapsed');
   if (innerWidth < 1050 && !$('chats-panel').classList.contains('collapsed')) $('prompt-nav').classList.add('collapsed');
 };
+$('manual-backup').onclick = $('backup-current').onclick = backupCurrentSession;
+$('open-backups').onclick = () => { if (!state.busy) switchMode('backups'); };
+$('refresh-backups').onclick = loadBackups;
+$('backup-current-only').onchange = loadBackups;
+$('recovery-mode').onclick = () => { if (finishDraft()) switchMode('recovery'); };
+$('preview-recovery').onclick = previewRecovery;
+$('create-recovery-copy').onclick = createRecoveryCopy;
+$('export-handoff').onclick = exportHandoff;
+$('recovery-handoff').oninput = () => {
+  local.recoveryDraft = $('recovery-handoff').value;
+  $('handoff-bytes').textContent = `${new Blob([local.recoveryDraft]).size.toLocaleString()} B / 65,536 B`;
+};
+$('recovery-keep').oninput = renderStatus;
+$('recovery-copy-mode').onchange = () => { renderRecoveryPlan(); renderStatus(); };
 $('conversation-mode').onclick = () => { if (finishDraft()) switchMode('conversation'); };
 $('toggle-prompts').onclick = () => {
   $('prompt-nav').classList.toggle('collapsed');

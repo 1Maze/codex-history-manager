@@ -220,6 +220,33 @@ class StoreTests(unittest.TestCase):
             self.store.save(THREAD, opened["version"], self.serialize(self.records))
         self.assertEqual(self.path.read_text(), opened["source"])
 
+    def test_save_prefix_trim_at_turn_boundary(self):
+        second = json.loads(encode(self.records[1:]))
+        turn = "44444444-4444-4444-8444-444444444444"
+        for record in second:
+            payload = record["payload"]
+            if "turn_id" in payload:
+                payload["turn_id"] = turn
+            if "root_turn_id" in payload:
+                payload["root_turn_id"] = turn
+            if "internal_chat_message_metadata_passthrough" in payload:
+                payload["internal_chat_message_metadata_passthrough"]["turn_id"] = turn
+            if payload.get("item", {}).get("id"):
+                payload["item"]["id"] += "-second"
+            if payload.get("id"):
+                payload["id"] += "-second"
+        records = self.records + second
+        for ordinal, record in enumerate(records):
+            record["ordinal"] = ordinal
+        self.path.write_text(self.serialize(records), encoding="utf-8")
+        opened = self.store.open(THREAD)
+        kept = [records[0]] + records[6:]
+        saved = self.store.save(THREAD, opened["version"], self.serialize(kept))
+        self.assertEqual(saved["info"]["health"], "aligned")
+        self.assertEqual(saved["info"]["counts"]["thread_turns"], 1)
+        self.assertTrue(any(row["item_id"] == "agent-one-second" for row in self.store.table(THREAD, "thread_items")["rows"]))
+        self.assertFalse(any(row["item_id"] == "agent-one" for row in self.store.table(THREAD, "thread_items")["rows"]))
+
     def test_unicode_line_separator_inside_json_string(self):
         opened = self.store.open(THREAD)
         self.records[3]["payload"]["item"]["content"][0]["text"] = "一\u2028二"

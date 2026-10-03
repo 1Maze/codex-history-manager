@@ -20,6 +20,8 @@
     <button id="open" class="button" title="打开普通 JSONL 文件（不关联 SQLite）"><i data-lucide="folder-open"></i><span>打开文件</span></button>
     <button id="save" class="button primary" disabled><i data-lucide="save"></i><span>保存原文件</span></button>
     <button id="save-as" class="icon-button" title="另存为" aria-label="另存为" disabled><i data-lucide="download"></i></button>
+    <button id="manual-backup" class="icon-button" title="备份当前会话的磁盘数据" aria-label="备份当前会话" disabled><i data-lucide="archive"></i></button>
+    <button id="open-backups" class="icon-button" title="备份管理" aria-label="备份管理"><i data-lucide="history"></i></button>
   </header>
   <div class="file-bar">
     <div class="filename"><i data-lucide="file-json"></i><span id="filename">未打开文件</span><span id="dirty" hidden>未保存</span></div>
@@ -32,6 +34,7 @@
       <button id="conversation-mode" role="tab" aria-selected="true"><i data-lucide="messages-square"></i>对话</button>
       <button id="jsonl-mode" role="tab" aria-selected="false"><i data-lucide="file-json"></i>原始数据</button>
       <button id="sqlite-mode" role="tab" aria-selected="false" disabled><i data-lucide="database"></i>SQLite</button>
+      <button id="recovery-mode" role="tab" aria-selected="false" title="对话截选"><i data-lucide="scissors"></i>对话截选</button>
     </div>
     <div class="sync-controls"><span id="index-health" class="health">未选择聊天</span>
     <span id="index-offset" class="index-offset"></span>
@@ -48,6 +51,17 @@
     <div id="chat-list" class="chat-list" aria-label="项目和聊天目录"></div>
     <button id="show-ignored-projects" class="sidebar-ignored"><i data-lucide="eye-off"></i><span>已忽略项目</span><span id="ignored-project-count" class="count">0</span></button>
   </aside>
+  <section id="backup-workspace" class="maintenance-workspace" hidden>
+    <div class="maintenance-toolbar"><h2>备份管理</h2><label><input id="backup-current-only" type="checkbox">仅当前会话</label><button id="refresh-backups" class="icon-button" title="刷新备份列表" aria-label="刷新备份列表"><i data-lucide="refresh-cw"></i></button><button id="backup-current" class="button"><i data-lucide="archive"></i>备份当前会话</button></div>
+    <div class="maintenance-notice">恢复仅处理所选会话的 JSONL 并重建索引，不回滚其他聊天；恢复前会再次备份当前状态。</div>
+    <div id="backup-list" class="backup-list"></div>
+  </section>
+  <section id="recovery-workspace" class="maintenance-workspace" hidden>
+    <div class="maintenance-toolbar"><h2>对话截选</h2><label>副本类型 <select id="recovery-copy-mode" aria-label="副本类型"><option value="conversation">原始对话截选</option><option value="handoff">单条续聊文本</option></select></label><label>保留最近完整轮次 <input id="recovery-keep" type="number" min="1" max="20" value="1" aria-label="保留最近完整轮次"></label><button id="preview-recovery" class="button"><i data-lucide="refresh-cw"></i>生成预览</button></div>
+    <div class="maintenance-notice">创建前自动备份，原会话保持不变。保留工具输出可能仍超过模型上下文限制；尚未验证模型续聊。</div>
+    <div id="recovery-stats" class="recovery-stats"></div>
+    <div class="recovery-body"><div id="recovery-turn-list" class="recovery-turn-list"></div><div class="handoff-panel"><label id="recovery-preview-label" for="recovery-handoff">所选对话</label><div id="recovery-conversation" class="recovery-conversation"></div><textarea id="recovery-handoff" aria-label="续聊文本" spellcheck="false" hidden></textarea><div class="handoff-actions"><span id="handoff-bytes">0 B</span><button id="export-handoff" class="button" disabled><i data-lucide="download"></i>导出文本</button><button id="create-recovery-copy" class="button primary" disabled><i data-lucide="file-plus"></i>生成独立副本</button></div></div></div>
+  </section>
   <section id="ignored-workspace" class="ignored-workspace" hidden>
     <div class="ignored-toolbar"><button id="ignored-back" class="icon-button" title="返回上一视图" aria-label="返回上一视图"><i data-lucide="arrow-left"></i></button><h2>已忽略项目</h2><span id="ignored-total">0 个项目</span><button id="restore-all-projects" class="button" title="恢复全部已忽略项目"><i data-lucide="rotate-ccw"></i>全部恢复</button></div>
     <label class="search ignored-search"><i data-lucide="search"></i><input id="ignored-search" placeholder="搜索已忽略项目..." aria-label="搜索已忽略项目"></label>
@@ -75,7 +89,7 @@
       <div class="editor-toolbar">
         <div class="tabs" role="tablist" aria-label="编辑视图"><button id="record-tab" role="tab" aria-selected="true">单条记录</button><button id="source-tab" role="tab" aria-selected="false">完整文件</button></div>
         <span id="selection-label"></span>
-        <div class="editor-actions"><button id="format" class="icon-button" title="格式化当前内容" aria-label="格式化当前内容" disabled><i data-lucide="align-left"></i></button><button id="undo" class="icon-button" title="撤销" aria-label="撤销" disabled><i data-lucide="undo-2"></i></button><button id="redo" class="icon-button" title="重做" aria-label="重做" disabled><i data-lucide="redo-2"></i></button><span class="divider"></span><button id="delete" class="icon-button danger" title="删除记录" aria-label="删除记录" disabled><i data-lucide="trash-2"></i></button><button id="delete-after" class="icon-button danger" title="删除当前记录之后的所有记录（保留当前记录）" aria-label="删除后续所有记录" disabled><i data-lucide="list-x"></i></button></div>
+        <div class="editor-actions"><button id="format" class="icon-button" title="格式化当前内容" aria-label="格式化当前内容" disabled><i data-lucide="align-left"></i></button><button id="undo" class="icon-button" title="撤销" aria-label="撤销" disabled><i data-lucide="undo-2"></i></button><button id="redo" class="icon-button" title="重做" aria-label="重做" disabled><i data-lucide="redo-2"></i></button><span class="divider"></span><button id="delete" class="icon-button danger" title="删除记录" aria-label="删除记录" disabled><i data-lucide="trash-2"></i></button><button id="delete-before" class="icon-button danger" title="删除当前记录之前的所有记录（保留当前记录）" aria-label="删除之前所有记录" disabled><i data-lucide="list-start"></i></button><button id="delete-after" class="icon-button danger" title="删除当前记录之后的所有记录（保留当前记录）" aria-label="删除后续所有记录" disabled><i data-lucide="list-x"></i></button></div>
       </div>
       <div id="empty" class="empty">
         <span class="empty-icon"><i data-lucide="file-json-2"></i></span>

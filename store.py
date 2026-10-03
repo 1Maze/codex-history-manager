@@ -193,7 +193,7 @@ class NativeParser:
         self.binary = binary or shutil.which("codex") or (
             str(bundled) if bundled.exists() else None)
 
-    def project(self, home, thread_id):
+    def run_local(self, home, work):
         if not self.binary:
             raise StoreError("找不到 Codex CLI；未修改原文件。", 503)
         env = dict(os.environ, CODEX_HOME=str(home))
@@ -250,15 +250,7 @@ class NativeParser:
                                      "explicitGatewayOauth": True},
                 })
                 send({"method": "initialized", "params": {}})
-                # Fork preparation performs a full durable projection, unlike list/read.
-                # This child exists exclusively in the temporary home and is discarded.
-                result = request(2, "thread/fork", {
-                    "threadId": thread_id, "excludeTurns": True, "ephemeral": True,
-                    "cwd": str(home), "modelProvider": "openai", "sandbox": "read-only",
-                    "config": {"features.hooks": False, "features.plugins": False,
-                               "features.shell_snapshot": False},
-                })
-                return {"keys": list(result)}
+                return work(request)
             finally:
                 process.terminate()
                 try:
@@ -269,6 +261,34 @@ class NativeParser:
                 reader.join(timeout=5)
                 process.stdin.close()
                 process.stdout.close()
+
+    def project(self, home, thread_id):
+        def work(request):
+            # Fork preparation performs a full durable projection, unlike list/read.
+            result = request(2, "thread/fork", {
+                    "threadId": thread_id, "excludeTurns": True, "ephemeral": True,
+                    "cwd": str(home), "modelProvider": "openai", "sandbox": "read-only",
+                    "config": {"features.hooks": False, "features.plugins": False,
+                               "features.shell_snapshot": False},
+            })
+            return {"keys": list(result)}
+        return self.run_local(home, work)
+
+    def create_text_session(self, home, text, title):
+        def work(request):
+            result = request(2, "thread/start", {
+                "cwd": str(home), "ephemeral": False, "modelProvider": "openai",
+                "sandbox": "read-only",
+                "config": {"features.hooks": False, "features.plugins": False,
+                           "features.shell_snapshot": False},
+            })
+            thread_id = result["thread"]["id"]
+            request(3, "thread/inject_items", {"threadId": thread_id, "items": [{
+                "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}],
+            }]})
+            request(4, "thread/name/set", {"threadId": thread_id, "name": title})
+            return thread_id
+        return self.run_local(home, work)
 
 
 class ChatStore:

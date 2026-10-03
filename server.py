@@ -9,6 +9,7 @@ import sqlite3
 from urllib.parse import parse_qs, urlparse
 
 from store import ChatStore, StoreError, encode
+from recovery import RecoveryService
 
 
 STATIC = Path(__file__).parent / "static"
@@ -24,6 +25,7 @@ class LocalServer(ThreadingHTTPServer):
     def __init__(self, address, store):
         super().__init__(address, Handler)
         self.store = store
+        self.recovery = RecoveryService(store)
         self.token = secrets.token_urlsafe(32)
         self.origin = f"http://127.0.0.1:{self.server_port}"
 
@@ -89,6 +91,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif parsed.path == "/api/table":
                     result = self.server.store.table(thread_id, args.get("table", ""),
                                                      offset, limit)
+                elif parsed.path == "/api/backups":
+                    result = self.server.recovery.backups(thread_id or None)
                 else:
                     raise StoreError("接口不存在。", 404)
                 return self.respond(200, result)
@@ -107,7 +111,8 @@ class Handler(BaseHTTPRequestHandler):
             self.security()
             if self.headers.get("Origin") != self.server.origin:
                 raise StoreError("写入请求必须来自本机同源页面。", 403)
-            if urlparse(self.path).path != "/api/save":
+            route = urlparse(self.path).path
+            if route not in ("/api/save", "/api/backup", "/api/restore", "/api/recovery/preview", "/api/recovery/create"):
                 raise StoreError("接口不存在。", 404)
             if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 raise StoreError("需要 application/json 请求。", 415)
@@ -117,8 +122,18 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise StoreError("请求必须为 JSON 对象。")
-            result = self.server.store.save(body.get("id"), body.get("version"),
-                                            body.get("source"), body.get("mirror", True))
+            if route == "/api/save":
+                result = self.server.store.save(body.get("id"), body.get("version"),
+                                               body.get("source"), body.get("mirror", True))
+            elif route == "/api/backup":
+                result = self.server.recovery.backup(body.get("id"))
+            elif route == "/api/restore":
+                result = self.server.recovery.restore(body.get("id"), body.get("version"), body.get("backupId"))
+            elif route == "/api/recovery/preview":
+                result = self.server.recovery.preview(body.get("id"), body.get("version"), body.get("keep", 1))
+            else:
+                result = self.server.recovery.create_copy(body.get("id"), body.get("version"), body.get("keep", 1),
+                                                         body.get("handoff"), mode=body.get("mode", "conversation"))
             self.respond(200, result)
         except (StoreError, ValueError, sqlite3.Error, OSError) as error:
             self.respond(error.status if isinstance(error, StoreError) else 400,
