@@ -10,7 +10,8 @@ import tempfile
 import uuid
 
 from store import (StoreError, HISTORY_TABLES, atomic_write, backup_database,
-                   connect, encode, fingerprint, jsonl_lines)
+                   connect, encode, fingerprint, jsonl_lines, linked_messages)
+from backup_management import backup_deletable, backup_title, delete_backup as delete_backup_directory
 
 
 def file_hash(path):
@@ -109,8 +110,7 @@ def recovery_turns(sources):
     return [turns[key] for key in ordered]
 
 
-def conversation_records(native_meta, source_meta, selected, thread_id):
-    """Copy protocol records, not a flattened text transcript or old model checkpoint."""
+def independent_session_meta(native_meta, source_meta, thread_id):
     first = json.loads(encode(source_meta))
     for field in ("history_base", "forked_from_id", "forked_from_ordinal_exclusive"):
         first.pop(field, None)
@@ -118,6 +118,12 @@ def conversation_records(native_meta, source_meta, selected, thread_id):
         if field in native_meta:
             first[field] = native_meta[field]
     first.update(id=thread_id, session_id=thread_id, history_mode="paginated")
+    return first
+
+
+def conversation_records(native_meta, source_meta, selected, thread_id):
+    """Copy protocol records, not a flattened text transcript or old model checkpoint."""
+    first = independent_session_meta(native_meta, source_meta, thread_id)
     records = [{"type": "session_meta", "timestamp": native_meta.get("timestamp"), "payload": first}]
     calls = {}
     pairs = {"function_call_output": "function_call", "custom_tool_call_output": "custom_tool_call",
@@ -268,7 +274,7 @@ class RecoveryService:
         with store.mutex, contextlib.ExitStack() as stack:
             parents = store.lineage(thread_id)
             if not _locked:
-                for identifier in sorted({thread_id, *(parent["id"] for parent in parents)}):
+                for identifier in sorted({thread_id, *(parent["ownerId"] for parent in parents)}):
                     stack.enter_context(store.writer_lock(identifier))
             opened = store.open(thread_id)
             baseline = store.snapshots[opened["version"]]
@@ -319,25 +325,32 @@ class RecoveryService:
         rows = []
         if self.store.recovery_root.exists():
             for journal in self.store.recovery_root.glob("*/journal.json"):
-                if journal.parent.is_symlink():
+                if journal.parent.is_symlink() or journal.is_symlink():
                     continue
                 try:
                     entry = json.loads(journal.read_text("utf-8"))
+                    if not isinstance(entry, dict):
+                        continue
                     if entry.get("kind") == "recovery_copy":
                         continue
                     if thread_id and entry.get("threadId") != thread_id:
                         continue
                     raw_path = journal.parent / "rollout.before.jsonl"
                     rows.append({"backupId": journal.parent.name, "threadId": entry.get("threadId"),
-                                 "title": entry.get("title") or entry.get("threadId", ""),
+                                 "title": backup_title(raw_path, entry.get("threadId"), entry.get("cwd", "")),
                                  "createdAt": entry.get("createdAt", ""), "kind": entry.get("kind", "automatic"),
                                  "status": entry.get("status"), "fileBytes": raw_path.stat().st_size if raw_path.exists() else 0,
                                  "backupPath": str(journal.parent),
+                                 "deletable": backup_deletable(entry),
                                  "restorable": entry.get("status") in ("snapshot", "committed", "rolled_back") and raw_path.is_file()})
                 except (OSError, ValueError):
                     continue
         rows.sort(key=lambda row: row["backupId"], reverse=True)
         return {"rows": rows}
+
+    def delete_backup(self, backup_id):
+        with self.store.mutex:
+            return delete_backup_directory(self.store.recovery_root, backup_id)
 
     def restore(self, thread_id, version, backup_id):
         directory = self.backup_path(backup_id)
@@ -369,7 +382,7 @@ class RecoveryService:
             metadata, path = store.thread(thread_id)
             store.check_baseline(thread_id, baseline, metadata, path, path.read_bytes())
             sources = [{"id": parent["id"], "source": parent["data"][:parent["end"]].decode("utf-8")}
-                       for parent in reversed(store.lineage(thread_id))]
+                       for parent in reversed(store.lineage(thread_id, path=path))]
             sources.append({"id": thread_id, "source": path.read_text("utf-8")})
             turns = recovery_turns(sources)
             complete = [turn for turn in turns if turn["status"] == "completed" and turn["messages"]]
@@ -427,7 +440,7 @@ class RecoveryService:
                                 if m["role"] == "user"), "对话截选")
             suffix = " · 对话截选" if mode == "conversation" else " · 恢复副本"
             with contextlib.ExitStack() as stack:
-                for identifier in sorted({thread_id, *(p["id"] for p in store.lineage(thread_id))}):
+                for identifier in sorted({thread_id, *(p["ownerId"] for p in store.lineage(thread_id))}):
                     stack.enter_context(store.writer_lock(identifier))
                 backup = self.backup(thread_id, kind="recovery", _locked=True)
                 with tempfile.TemporaryDirectory(prefix="codex-recovery-copy-") as temporary:
@@ -467,79 +480,162 @@ class RecoveryService:
                     records = materialize_imported_user(records, new_id, handoff)
                     if mode == "conversation":
                         records = conversation_records(first, plan["_sessionMeta"], plan["_selected"], new_id)
-                    source = ("".join(encode(record) + "\n" for record in records)).encode("utf-8")
-                    if len(source) > 180 * 1024 * 1024:
-                        raise StoreError("对话截选超过 180 MiB，请减少保留轮次。")
-                    native_path = Path(row["rollout_path"])
-                    atomic_write(native_path, source)
-                    with connect(home / "thread_history_1.sqlite") as db:
-                        for table in HISTORY_TABLES:
-                            db.execute(f'DELETE FROM "{table}" WHERE thread_id=?', (new_id,))
-                    store.parser.project(home, new_id)
-                    with connect(home / "thread_history_1.sqlite", True) as db:
-                        projected = store.history_rows(new_id, db)
-                    if mode == "conversation":
-                        expected_ids = {record["payload"]["item"]["id"] for record in records
-                                        if record["type"] == "event_msg" and
-                                        record["payload"].get("type") == "item_completed" and
-                                        record["payload"].get("item", {}).get("id")}
-                        actual_ids = {item["item_id"] for item in projected.get("thread_items", [])}
-                        if not expected_ids <= actual_ids:
-                            raise StoreError("原生解析未保留全部消息或工具项目，未注册副本。", 503)
-                    projection = projected.get("thread_history_projection_state", [])
-                    if len(projection) != 1 or projection[0]["next_rollout_byte_offset"] != len(source):
-                        raise StoreError("独立副本索引校验失败，未注册。", 503)
-                    live_metadata, live_path = store.thread(thread_id)
-                    store.check_baseline(thread_id, baseline, live_metadata, live_path, live_path.read_bytes())
-                    destination = store.home / "sessions" / native_path.relative_to(home / "sessions")
-                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    def check_source():
+                        live_metadata, live_path = store.thread(thread_id)
+                        store.check_baseline(thread_id, baseline, live_metadata, live_path, live_path.read_bytes())
                     row = visible_copy_metadata(row, metadata, handoff)
-                    row["rollout_path"] = str(destination)
-                    install = store.recovery_root / ("copy-" + new_id)
-                    install.mkdir(mode=0o700)
-                    journal = {"threadId": new_id, "sourceThreadId": thread_id, "kind": "recovery_copy",
-                               "mode": mode, "keep": keep, "selectedTurnIds": [t["id"] for t in plan["_selected"]],
-                               "status": "prepared", "path": str(destination),
-                               "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
-                    store.write_journal(install, journal)
-                    with connect(store.state_db) as db:
-                        db.execute("ATTACH DATABASE ? AS history", (str(store.history_db),))
-                        created_file = False
-                        try:
-                            db.execute("BEGIN IMMEDIATE")
-                            columns = [r["name"] for r in db.execute("PRAGMA table_info(threads)")]
-                            if set(columns) != set(row):
-                                raise StoreError("原生数据库结构与本机不一致，未创建副本。", 503)
-                            db.execute("INSERT INTO threads (" + ",".join('"' + c + '"' for c in columns) +
-                                       ") VALUES (" + ",".join("?" for _ in columns) + ")", [row[c] for c in columns])
-                            for table, rows in projected.items():
-                                names = [r["name"] for r in db.execute(f'PRAGMA history.table_info("{table}")')]
-                                for values in rows:
-                                    if set(names) != set(values):
-                                        raise StoreError("历史索引结构不一致，未创建副本。", 503)
-                                    db.execute(f'INSERT INTO history."{table}" (' +
-                                               ",".join('"' + c + '"' for c in names) + ") VALUES (" +
-                                               ",".join("?" for _ in names) + ")", [values[c] for c in names])
-                            if destination.exists():
-                                raise StoreError("副本路径已经存在，拒绝覆盖。", 409)
-                            created_file = True
-                            atomic_write(destination, source)
-                            db.commit()
-                        except Exception:
-                            db.rollback()
-                            if created_file and destination.exists() and destination.read_bytes() == source:
-                                destination.unlink()
-                            journal["status"] = "rolled_back"
-                            store.write_journal(install, journal)
-                            raise
-                    journal["status"] = "committed"
-                    try:
-                        store.write_journal(install, journal)
-                    except OSError:
-                        store.blocked.add(new_id)
-                        raise StoreError(f"副本已创建，但恢复日志未完成，请检查 {install}", 500)
-                    return {"threadId": new_id, "title": row["name"], "backupId": backup["backupId"],
-                            "backupPath": backup["backupPath"], "path": str(destination),
-                            "mode": mode, "selectedTurns": plan["selectedTurns"],
+                    result = self.install_copy(home, row, records, {
+                        "sourceThreadId": thread_id, "mode": mode, "keep": keep,
+                        "selectedTurnIds": [t["id"] for t in plan["_selected"]],
+                    }, check_source)
+                    return {**result, "backupId": backup["backupId"], "backupPath": backup["backupPath"],
+                            "selectedTurns": plan["selectedTurns"],
                             "toolCalls": plan["selectedToolCalls"] if mode == "conversation" else 0,
-                            "fileBytes": len(source), "textBytes": len(handoff.encode("utf-8"))}
+                            "textBytes": len(handoff.encode("utf-8"))}
+
+    def create_edited_copy(self, thread_id, version, source, baseline_source, mirror=True):
+        store = self.store
+        with store.mutex:
+            baseline = store.snapshots.get(version)
+            if not baseline or baseline["threadId"] != thread_id:
+                raise StoreError("编辑快照已失效，请重新读取聊天。", 409)
+            if (not isinstance(baseline_source, str) or
+                    fingerprint(baseline_source.encode("utf-8")) != baseline["fileHash"]):
+                raise StoreError("原始快照校验失败，无法保存独立副本。", 409)
+            if not isinstance(mirror, bool):
+                raise StoreError("关联消息选项必须为布尔值。")
+            data, _ = store.normalize(source, thread_id)
+            original_meta = json.loads(jsonl_lines(baseline_source)[0])["payload"]
+            if json.loads(data.split(b"\n", 1)[0])["payload"] != original_meta:
+                raise StoreError("session_meta 为只读；不能更改会话元数据后另存副本。")
+            linked_count = 0
+            if mirror:
+                linked, linked_count = linked_messages(data.decode("utf-8"), baseline_source)
+                data, _ = store.normalize(linked, thread_id)
+            def check_source():
+                if store.lineage_fingerprint(thread_id, path=Path(baseline["path"]),
+                                            meta=original_meta) != baseline["lineageHash"]:
+                    raise StoreError("继承的父聊天记录已被修改，不能混用历史创建副本。", 409)
+            check_source()
+            metadata, _ = store.thread(thread_id)
+            parents = store.lineage(thread_id, path=Path(baseline["path"]), meta=original_meta)
+            if len(data) + sum(parent["end"] for parent in parents) > 180 * 1024 * 1024:
+                raise StoreError("副本及继承数据超过 180 MiB，请减少数据后再保存。")
+            records = []
+            for parent in reversed(parents):
+                for line in jsonl_lines(parent["data"][:parent["end"]].decode("utf-8")):
+                    record = json.loads(line)
+                    if record["type"] != "session_meta":
+                        records.append(record)
+            records.extend(json.loads(line) for line in jsonl_lines(data.decode("utf-8"))[1:])
+            prompt = next((text_content(r["payload"]["item"].get("content"))
+                           for r in records if r["type"] == "event_msg" and
+                           r["payload"].get("item", {}).get("type") == "UserMessage"), "编辑副本")
+            title = (metadata.get("name") or metadata["title"])[:120] + " · 编辑副本"
+            with tempfile.TemporaryDirectory(prefix="codex-edited-copy-") as temporary:
+                home = Path(temporary).resolve()
+                new_id = store.parser.create_text_session(home, "编辑副本", title)
+                with connect(home / "state_5.sqlite", True) as db:
+                    row = dict(db.execute("SELECT * FROM threads WHERE id=?", (new_id,)).fetchone())
+                native_meta = json.loads(Path(row["rollout_path"]).read_text("utf-8").splitlines()[0])["payload"]
+                copied = [{"type": "session_meta", "timestamp": native_meta["timestamp"],
+                           "payload": independent_session_meta(native_meta, original_meta, new_id)}]
+                active = {}
+                for record in records:
+                    payload = record["payload"]
+                    if "thread_id" in payload:
+                        payload["thread_id"] = new_id
+                    if record["type"] == "event_msg":
+                        if payload.get("type") == "task_started":
+                            active[payload.get("turn_id")] = payload.get("started_at")
+                        elif payload.get("type") in ("task_complete", "turn_aborted", "task_failed"):
+                            active.pop(payload.get("turn_id"), None)
+                    copied.append(record)
+                now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                for turn_id, started_at in active.items():
+                    if turn_id:
+                        copied.append({"type": "event_msg", "timestamp": now, "payload": {
+                            "type": "turn_aborted", "turn_id": turn_id, "reason": "interrupted",
+                            "started_at": started_at}})
+                for ordinal, record in enumerate(copied):
+                    record["ordinal"] = ordinal
+                row = visible_copy_metadata(row, metadata, prompt or "编辑副本")
+                result = self.install_copy(home, row, copied, {
+                    "sourceThreadId": thread_id, "mode": "edited", "sourceSnapshotHash": baseline["fileHash"],
+                }, check_source, {"editor.baseline.jsonl": baseline_source.encode("utf-8"),
+                                  "editor.draft.jsonl": data})
+                return {**result, "linkedChanges": linked_count, "backupPath": result["journalPath"]}
+
+    def install_copy(self, home, row, records, journal_fields, check_source, snapshot_files=None):
+        """Project offline, then install only the fresh thread's rows and file."""
+        store, new_id = self.store, row["id"]
+        source = "".join(encode(record) + "\n" for record in records).encode("utf-8")
+        if len(source) > 180 * 1024 * 1024:
+            raise StoreError("独立副本超过 180 MiB，请减少数据后再保存。")
+        native_path = Path(row["rollout_path"])
+        atomic_write(native_path, source)
+        with connect(home / "thread_history_1.sqlite") as db:
+            for table in HISTORY_TABLES:
+                db.execute(f'DELETE FROM "{table}" WHERE thread_id=?', (new_id,))
+        store.parser.project(home, new_id)
+        with connect(home / "thread_history_1.sqlite", True) as db:
+            projected = store.history_rows(new_id, db)
+        expected_ids = {r["payload"]["item"]["id"] for r in records if r["type"] == "event_msg"
+                        and r["payload"].get("type") == "item_completed"
+                        and r["payload"].get("item", {}).get("id")}
+        actual_ids = {item["item_id"] for item in projected.get("thread_items", [])}
+        projection = projected.get("thread_history_projection_state", [])
+        if not expected_ids <= actual_ids:
+            raise StoreError("原生解析未保留全部消息或工具项目，未注册副本。", 503)
+        if len(projection) != 1 or projection[0]["next_rollout_byte_offset"] != len(source):
+            raise StoreError("独立副本索引校验失败，未注册。", 503)
+        check_source()
+        destination = store.home / "sessions" / native_path.relative_to(home / "sessions")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        row["rollout_path"] = str(destination)
+        install = store.recovery_root / ("copy-" + new_id)
+        store.recovery_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        install.mkdir(mode=0o700)
+        journal = {**journal_fields, "threadId": new_id, "kind": "recovery_copy", "status": "prepared",
+                   "path": str(destination), "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        store.write_journal(install, journal)
+        for name, data in (snapshot_files or {}).items():
+            atomic_write(install / name, data)
+        with connect(store.state_db) as db:
+            db.execute("ATTACH DATABASE ? AS history", (str(store.history_db),))
+            created_file = False
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                columns = [r["name"] for r in db.execute("PRAGMA table_info(threads)")]
+                if set(columns) != set(row):
+                    raise StoreError("原生数据库结构与本机不一致，未创建副本。", 503)
+                db.execute("INSERT INTO threads (" + ",".join('"' + c + '"' for c in columns) +
+                           ") VALUES (" + ",".join("?" for _ in columns) + ")", [row[c] for c in columns])
+                for table, rows in projected.items():
+                    names = [r["name"] for r in db.execute(f'PRAGMA history.table_info("{table}")')]
+                    for values in rows:
+                        if set(names) != set(values):
+                            raise StoreError("历史索引结构不一致，未创建副本。", 503)
+                        db.execute(f'INSERT INTO history."{table}" (' +
+                                   ",".join('"' + c + '"' for c in names) + ") VALUES (" +
+                                   ",".join("?" for _ in names) + ")", [values[c] for c in names])
+                if destination.exists():
+                    raise StoreError("副本路径已经存在，拒绝覆盖。", 409)
+                created_file = True
+                atomic_write(destination, source)
+                db.commit()
+            except Exception:
+                db.rollback()
+                if created_file and destination.exists() and destination.read_bytes() == source:
+                    destination.unlink()
+                journal["status"] = "rolled_back"
+                store.write_journal(install, journal)
+                raise
+        journal["status"] = "committed"
+        try:
+            store.write_journal(install, journal)
+        except OSError:
+            store.blocked.add(new_id)
+            raise StoreError(f"副本已创建，但恢复日志未完成，请检查 {install}", 500)
+        return {"threadId": new_id, "title": row["name"], "path": str(destination),
+                "mode": journal_fields["mode"], "fileBytes": len(source), "journalPath": str(install)}

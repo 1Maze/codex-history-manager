@@ -12,6 +12,7 @@ from store import ChatStore, ClosingConnection, StoreError, connect, encode
 
 THREAD = "11111111-1111-4111-8111-111111111111"
 TURN = "22222222-2222-4222-8222-222222222222"
+SEGMENT = "55555555-5555-4555-8555-555555555555"
 
 
 def clone_schema(source, target):
@@ -84,6 +85,48 @@ def fixture(home):
                    ') VALUES (' + ','.join('?' for _ in columns) + ')',
                    [row[c] for c in columns])
     return path, records
+
+
+def segmented_fixture(home):
+    root, records = fixture(home)
+    paths = [root]
+    previous_id, previous_records = THREAD, records
+    for index, segment_id in enumerate((SEGMENT, "77777777-7777-4777-8777-777777777777"), 1):
+        meta = json.loads(encode(records[0]))
+        end_ordinal = previous_records[-1]["ordinal"] + 1
+        meta["payload"]["history_base"] = {"thread_id": previous_id,
+            "end_ordinal_exclusive": end_ordinal, "end_byte_offset": paths[-1].stat().st_size}
+        meta["ordinal"] = end_ordinal
+        body = json.loads(encode(records[1:]))
+        turn_id = f"44444444-4444-4444-8444-{index:012d}"
+        for record in body:
+            payload = record["payload"]
+            if "turn_id" in payload:
+                payload["turn_id"] = turn_id
+            if "root_turn_id" in payload:
+                payload["root_turn_id"] = turn_id
+            if payload.get("internal_chat_message_metadata_passthrough"):
+                payload["internal_chat_message_metadata_passthrough"]["turn_id"] = turn_id
+            item = payload.get("item")
+            if item:
+                item["id"] += f"-segment-{index}"
+                item["content"][0]["text"] = f"segment {index} " + (
+                    "question" if item["type"] == "UserMessage" else "answer")
+            if record["type"] == "response_item":
+                payload["id"] += f"-segment-{index}"
+                payload["content"][0]["text"] = f"segment {index} answer"
+            if payload.get("type") == "task_complete":
+                payload["last_agent_message"] = f"segment {index} answer"
+        current = [meta] + body
+        for ordinal, record in enumerate(current, end_ordinal):
+            record["ordinal"] = ordinal
+        path = root.parent / f"rollout-2026-10-02T10-0{index}-00-{THREAD}_{segment_id}.jsonl"
+        path.write_text("".join(encode(record) + "\n" for record in current))
+        paths.append(path)
+        previous_id, previous_records = segment_id, current
+    with connect(home / "state_5.sqlite") as db:
+        db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(paths[-1]), THREAD))
+    return paths
 
 
 class StoreTests(unittest.TestCase):
@@ -304,6 +347,91 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(saved["info"]["projection"]["next_rollout_ordinal"], 8)
         self.assertEqual(self.path.read_bytes(), parent_before)
         self.assertEqual(saved["info"]["fileBytes"], path.stat().st_size)
+
+    def test_segmented_history_resolves_unindexed_segments_and_same_owner(self):
+        extra = tempfile.TemporaryDirectory(prefix="segment-fixture-")
+        try:
+            home = Path(extra.name)
+            paths = segmented_fixture(home)
+            store = ChatStore(home)
+            parents = store.lineage(THREAD)
+            self.assertEqual([p["id"] for p in parents], [SEGMENT, THREAD])
+            self.assertEqual([p["path"] for p in parents], [p.resolve() for p in reversed(paths[:-1])])
+            self.assertTrue(all(parent["ownerId"] == THREAD for parent in parents))
+            opened = store.open(THREAD)
+            self.assertEqual(len(opened["inherited"]), 2)
+            self.assertIn("fixture question", opened["inherited"][0]["source"])
+            self.assertIn("segment 1 question", opened["inherited"][1]["source"])
+            self.assertTrue(all(source["readOnly"] for source in opened["inherited"]))
+            with connect(store.history_db) as db:
+                db.execute("INSERT INTO thread_history_projection_state VALUES (?,?,?)", (THREAD, 42, 1))
+                db.execute("INSERT INTO thread_history_projection_state VALUES (?,?,?)", (SEGMENT, 63, 7))
+            opened = store.open(THREAD)
+            before = [path.read_bytes() for path in paths]
+            saved = store.save(THREAD, opened["version"], opened["source"])
+            self.assertEqual(saved["info"]["health"], "aligned")
+            self.assertEqual(saved["info"]["historyId"], "77777777-7777-4777-8777-777777777777")
+            with connect(store.history_db, True) as db:
+                self.assertEqual(db.execute("SELECT next_rollout_byte_offset FROM thread_history_projection_state "
+                    "WHERE thread_id=?", (THREAD,)).fetchone()[0], 42)
+                self.assertEqual(db.execute("SELECT next_rollout_byte_offset FROM thread_history_projection_state "
+                    "WHERE thread_id=?", (SEGMENT,)).fetchone()[0], 63)
+            self.assertEqual([path.read_bytes() for path in paths[:-1]], before[:-1])
+        finally:
+            extra.cleanup()
+
+    def test_real_file_cycle_still_rejected(self):
+        self.records[0]["payload"]["history_base"] = {
+            "thread_id": THREAD, "end_byte_offset": self.path.stat().st_size,
+            "end_ordinal_exclusive": len(self.records)}
+        self.path.write_text(self.serialize(self.records))
+        with self.assertRaisesRegex(StoreError, "循环"):
+            self.store.lineage(THREAD)
+
+    def test_more_than_sixteen_legacy_parents_are_readable(self):
+        previous_id, previous_path, ordinal = THREAD, self.path, len(self.records)
+        for index in range(20):
+            identifier = f"88888888-8888-4888-8888-{index:012d}"
+            record = json.loads(encode(self.records[0]))
+            record["payload"].update(id=identifier, session_id=identifier, history_base={
+                "thread_id": previous_id, "end_byte_offset": previous_path.stat().st_size,
+                "end_ordinal_exclusive": ordinal})
+            record["ordinal"] = ordinal
+            path = self.path.parent / f"rollout-{identifier}.jsonl"
+            path.write_text(encode(record) + "\n")
+            with connect(self.store.state_db) as db:
+                row = dict(db.execute("SELECT * FROM threads WHERE id=?", (THREAD,)).fetchone())
+                row.update(id=identifier, rollout_path=str(path))
+                names = list(row)
+                db.execute("INSERT INTO threads (" + ",".join('"' + n + '"' for n in names) +
+                           ") VALUES (" + ",".join("?" for _ in names) + ")", [row[n] for n in names])
+            previous_id, previous_path = identifier, path
+            ordinal += 1
+        self.assertEqual(len(self.store.open(previous_id)["inherited"]), 20)
+
+    def test_ambiguous_history_segment_is_not_guessed(self):
+        branch, _ = self.make_branch()
+        archive = self.home / "archived_sessions"
+        archive.mkdir()
+        (archive / self.path.name).write_bytes(self.path.read_bytes())
+        with self.assertRaisesRegex(StoreError, "多个文件"):
+            self.store.lineage(branch)
+
+    def test_history_segment_cannot_escape_session_roots(self):
+        branch, _ = self.make_branch()
+        outside = self.home / "outside.jsonl"
+        self.path.rename(outside)
+        self.path.symlink_to(outside)
+        with self.assertRaisesRegex(StoreError, "sessions"):
+            self.store.lineage(branch)
+
+    def test_missing_segment_error_is_specific(self):
+        branch, path = self.make_branch()
+        meta = json.loads(path.read_text().splitlines()[0])
+        meta["payload"]["history_base"]["thread_id"] = "99999999-9999-4999-8999-999999999999"
+        path.write_text(encode(meta) + "\n")
+        with self.assertRaisesRegex(StoreError, "历史分段文件不存在"):
+            self.store.lineage(branch)
 
     def test_branch_rejects_changed_parent_prefix(self):
         branch, _ = self.make_branch()

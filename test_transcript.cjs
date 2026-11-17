@@ -59,4 +59,25 @@ assert.equal(transcript.editableText(attachmentRows, attachmentMessage), 'hello'
 const attachmentEdit = transcript.editMessage(attachmentRows, attachmentMessage, 'new prompt');
 assert.match(attachmentEdit.updates.get(0).payload.item.content[0].text, /context\n## My request:\nnew prompt/);
 assert.equal(attachmentEdit.updates.get(0).payload.item.content[1].image_url, 'keep-image');
+const claudeRows = [
+  { value: { type: 'user', uuid: 'user', message: { role: 'user', content: 'Claude question' } } },
+  { value: { type: 'user', uuid: 'meta', isMeta: true, message: { role: 'user', content: 'hidden context' } } },
+  { value: { type: 'assistant', uuid: 'assistant', message: { role: 'assistant', id: 'api-id', content: [
+    { type: 'thinking', thinking: 'secret reasoning', signature: 'keep-signature' },
+    { type: 'text', text: 'Claude answer' },
+    { type: 'tool_use', id: 'tool', name: 'Read', input: { path: 'keep-path' } },
+  ] } } },
+  { value: { type: 'user', uuid: 'result', message: { role: 'user', content: [
+    { type: 'tool_result', tool_use_id: 'tool', content: 'hidden tool output' },
+  ] } } },
+  { value: { type: 'api-request-blob', message: { role: 'assistant', content: 'duplicate audit text' } } },
+];
+const claudeMessages = transcript.readMessages(claudeRows);
+assert.deepEqual(claudeMessages.map(message => message.text), ['Claude question', 'Claude answer']);
+const claudeEdit = transcript.editMessage(claudeRows, claudeMessages[1], 'edited Claude answer');
+assert.equal(claudeEdit.updates.size, 1);
+assert.equal(claudeEdit.updates.get(2).message.content[1].text, 'edited Claude answer');
+assert.deepEqual(claudeEdit.updates.get(2).message.content[0], claudeRows[2].value.message.content[0]);
+assert.deepEqual(claudeEdit.updates.get(2).message.content[2], claudeRows[2].value.message.content[2]);
+assert.equal(claudeRows[2].value.message.content[1].text, 'Claude answer');
 console.log('PASS: canonical message extraction, raw-row mapping, duplicate suppression, context/tool/reasoning filtering, legacy messages, safe Markdown.');

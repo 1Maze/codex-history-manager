@@ -30,6 +30,20 @@
     return /^\s*<(environment_context|external_codex_apps_open_page|turn_aborted|permissions|collaboration_mode|user_instructions)(?:[>\s])/.test(text);
   }
   function readMessages(rows) {
+    if (rows.some(row => ['user', 'assistant'].includes(row.value?.type) && row.value?.message)) {
+      return rows.flatMap((row, rowIndex) => {
+        const record = row.value;
+        if (!['user', 'assistant'].includes(record?.type) || !record.message || record.isMeta || record.isSidechain) return [];
+        const content = record.message.content;
+        const text = typeof content === 'string' ? content : Array.isArray(content) ?
+          content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n') : '';
+        if (!text.trim()) return [];
+        return [{ key: `${record.type}:${record.uuid || rowIndex}`, recordId: record.uuid || null,
+          role: record.type, text: displayText(text), originalText: text.trim(), phase: '',
+          timestamp: record.timestamp || '', turn: '', rowIndex, sourceRows: [rowIndex],
+          lastRow: rowIndex, priority: 3, kind: 'claude', format: 'claude' }];
+      });
+    }
     const messages = [], byId = new Map(), recent = new Map();
     let currentTurn = '';
     for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
@@ -91,6 +105,13 @@
     return String(text).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
   }
   function textReference(record) {
+    if (['user', 'assistant'].includes(record?.type) && record.message) {
+      const value = record.message.content;
+      const text = typeof value === 'string' ? value : Array.isArray(value) ?
+        value.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n') : '';
+      return { target: record.message, role: record.type, id: record.uuid || null,
+        property: 'content', text, turn: '', phase: '', format: 'claude' };
+    }
     const payload = record?.payload;
     if (!payload || typeof payload !== 'object') return null;
     let target, role, property;
@@ -126,6 +147,7 @@
     else if (Array.isArray(value)) {
       let replaced = false;
       reference.target[reference.property] = value.map((part) => {
+        if (reference.format === 'claude' && part?.type !== 'text') return part;
         if (typeof part === 'string') { const next = replaced ? '' : text; replaced = true; return next; }
         if (typeof part?.text === 'string') { const next = { ...part, text: replaced ? '' : text }; replaced = true; return next; }
         return part;
@@ -137,6 +159,12 @@
     if (typeof text !== 'string' || !text.trim()) throw new Error('消息文本不能为空；删除记录请使用原始数据视图。');
     const canonical = textReference(rows[message.rowIndex]?.value);
     if (!canonical) throw new Error('原始消息已发生变化。');
+    if (canonical.format === 'claude') {
+      if (canonical.id !== message.recordId || canonical.role !== message.role) throw new Error('Claude 消息身份已发生变化。');
+      const copy = JSON.parse(JSON.stringify(rows[message.rowIndex].value));
+      replaceReferenceText(textReference(copy), text);
+      return { updates: new Map([[message.rowIndex, copy]]), relatedCount: 1 };
+    }
     const aliases = new Set(mirror ? message.sourceRows : [message.rowIndex]);
     const ids = new Set();
     for (const index of aliases) {

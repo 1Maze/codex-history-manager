@@ -9,7 +9,7 @@ const local = { token: '', tableOffset: 0, mode: 'conversation', row: null, chat
   groups: [], expanded: new Set(), groupsInitialized: false, searchCollapsed: new Set(), sidebarQuery: '',
   projectOrder: [], projectDrag: null, projectLimits: new Map(), loadingProjects: new Map(),
   ignoredProjects: new Map(), searchScope: null, menuProject: null, menuAnchor: null, lastDataMode: 'conversation',
-  recoveryPlan: null, recoveryDraft: null, backupRequest: 0 };
+  recoveryPlan: null, recoveryDraft: null, backupRequest: 0, provider: 'codex', providers: [] };
 const transcript = { source: null, inheritedRef: null, messages: [], prompts: [], expanded: new Set(), active: '', hover: null, observer: null, edit: null };
 let toastTimer, inputTimer;
 function icons() { window.lucide?.createIcons(); }
@@ -187,7 +187,11 @@ function renderStatus() {
   $('save-as').disabled = !state.opened || state.busy;
   $('manual-backup').disabled = $('backup-current').disabled = !state.sync || state.busy;
   $('preview-recovery').disabled = !state.sync || state.busy || dirty();
-  $('open-backups').disabled = $('recovery-mode').disabled = state.busy;
+  $('open-backups').disabled = state.busy;
+  $('refresh-backups').disabled = $('backup-current-only').disabled = state.busy;
+  $('recovery-mode').disabled = state.busy || local.provider === 'claude';
+  $('recovery-mode').hidden = local.provider === 'claude';
+  $('provider-select').disabled = state.busy;
   $('create-recovery-copy').disabled = state.busy || !local.recoveryPlan?.selectedTurns ||
     Number($('recovery-keep').value) !== local.recoveryPlan?.keep;
   $('export-handoff').disabled = state.busy || !local.recoveryPlan;
@@ -201,16 +205,20 @@ function renderStatus() {
   $('delete').disabled = state.view !== 'record' || state.selected < 0 || state.busy;
   $('delete-before').disabled = state.view !== 'record' || state.selected <= prefixDeletionStart() || state.busy;
   $('delete-after').disabled = state.view !== 'record' || state.selected < 0 || state.selected >= state.rows.length - 1 || state.busy;
+  $('delete-keywords').disabled = !state.opened || !state.rows.length || state.busy;
   $('undo').disabled = (!state.undo.length && state.draft === null) || state.busy;
   $('redo').disabled = !state.redo.length || state.busy;
   $('editor').readOnly = state.busy; $('record-tab').disabled = state.busy; $('source-tab').disabled = state.busy;
   $('search').disabled = !state.opened; $('errors-only').disabled = !state.opened;
   $('type-filter').disabled = !state.opened || state.busy;
   $('status').lastChild.textContent = state.busy ? '正在保存...' : error ? '存在 JSON 错误' : '就绪';
-  $('save-status').textContent = !state.opened ? '未打开文件' : dirty() ? '有未保存的修改' : state.sync ? 'JSONL / SQLite 已读取' : state.handle ? '与原文件一致' : '尚未关联原文件';
-  $('sqlite-mode').disabled = !state.sync || state.busy;
+  $('save-status').textContent = !state.opened ? '未打开文件' : dirty() ? '有未保存的修改' : state.sync ? local.provider === 'claude' ? 'Claude JSONL 已读取' : 'JSONL / SQLite 已读取' : state.handle ? '与原文件一致' : '尚未关联原文件';
+  $('sqlite-mode').disabled = !state.sync || state.busy || local.provider === 'claude';
+  $('sqlite-mode').hidden = local.provider === 'claude';
   $('reload-chat').disabled = !state.sync || state.busy;
-  $('repair-index').disabled = !state.sync || state.busy || dirty();
+  $('repair-index').disabled = !state.sync || state.busy || dirty() || local.provider === 'claude';
+  $('repair-index').hidden = local.provider === 'claude';
+  $('reload-chat').title = local.provider === 'claude' ? '重新读取 Claude Code 会话' : '重新读取聊天和 SQLite';
   $('chat-search').disabled = state.busy;
   $('refresh-chats').disabled = state.busy;
   $('expand-all-projects').disabled = $('collapse-all-projects').disabled = state.busy || !visibleProjectGroups().length;
@@ -219,7 +227,7 @@ function renderStatus() {
   $('restore-all-projects').disabled = state.busy || !local.ignoredProjects.size;
   document.querySelectorAll('.project-menu-trigger, .ignored-project-row button').forEach((button) => { button.disabled = state.busy; });
   document.querySelectorAll('.project-more, .project-less').forEach((button) => { button.disabled = state.busy || button.dataset.loading === 'true'; });
-  $('mirror-messages').disabled = !state.sync || state.busy;
+  $('mirror-messages').disabled = !state.sync || state.busy || local.provider === 'claude';
   document.querySelectorAll('.project-grip').forEach((grip) => {
     grip.disabled = state.busy || !!$('chat-search').value.trim() || !!local.searchScope || visibleProjectGroups().length < 2;
   });
@@ -245,6 +253,7 @@ function render(resetEditor = true) {
 }
 function confirmAction(title, message, action = '继续') {
   $('dialog-title').textContent = title; $('dialog-message').textContent = message; $('dialog-confirm').textContent = action;
+  $('confirm-dialog').returnValue = '';
   return new Promise((resolve) => {
     $('confirm-dialog').addEventListener('close', () => resolve($('confirm-dialog').returnValue === 'confirm'), { once: true });
     $('confirm-dialog').showModal();
@@ -381,6 +390,41 @@ async function deleteChecked() {
   state.checked.clear(); render();
   toast(`已删除 ${targets.size} 条记录，尚未保存到文件。`);
 }
+function keywordDeletionTargets() {
+  return state.rows.flatMap((row, index) => {
+    if (state.sync && row.value?.type === 'session_meta') return [];
+    const text = row.error ? row.raw : JSON.stringify(row.value);
+    const content = row.value?.message?.content;
+    const hiddenText = row.value?.type === 'user' && row.value.isMeta === true ?
+      (typeof content === 'string' ? content : Array.isArray(content) ?
+        content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n') : '') : '';
+    const hiddenNotice = /^\s*Your response above was stopped by a safety classifier\b/i.test(hiddenText);
+    const match = /safeguards|cyber/i.exec(text) ||
+      (hiddenNotice ? /stopped by a safety classifier/i.exec(text) : null);
+    if (!match) return [];
+    const start = Math.max(0, match.index - 25);
+    const excerpt = text.slice(start, match.index + 75).replace(/\s+/g, ' ');
+    return [{ index, hidden: hiddenNotice, preview: `第 ${index + 1} 行${hiddenNotice ? '（隐藏提示）' : ''}：${start ? '...' : ''}${excerpt}${text.length > match.index + 75 ? '...' : ''}` }];
+  });
+}
+async function deleteKeywords() {
+  if (!state.opened || state.busy) return;
+  flushSource();
+  if (!finishDraft()) return;
+  render();
+  const targets = keywordDeletionTargets();
+  if (!targets.length) { toast('当前文件没有匹配的 safeguards / cyber 记录或隐藏拦截提示。'); return; }
+  const source = state.source;
+  const preview = targets.slice(0, 5).map(target => target.preview).join('\n');
+  const hiddenCount = targets.filter(target => target.hidden).length;
+  if (!await confirmAction('删除匹配记录？',
+    `当前文件有 ${targets.length} 条匹配记录：包含 safeguards 或 cyber（忽略大小写），或 isMeta: true 的 stopped by a safety classifier 历史提示。其中隐藏提示 ${hiddenCount} 条。\n不受搜索、type、分页或勾选范围影响。\n${state.sync ? '保留 session_meta 会话头，不修改继承历史或其他会话。\n' : ''}删除后可撤销，保存后才写入文件；同步保存仍需通过原有校验。\n\n${preview}${targets.length > 5 ? `\n...另有 ${targets.length - 5} 条` : ''}`, `删除 ${targets.length} 条`)) return;
+  if (state.busy || state.source !== source) { toast('当前文件已发生变化，请重新确认删除范围。'); return; }
+  const indices = new Set(targets.map(target => target.index));
+  const selected = state.rows.slice(0, state.selected).filter((_, index) => !indices.has(index)).length;
+  applySource(textFromRows(state.rows.filter((_, index) => !indices.has(index))), selected);
+  render(); toast(`已删除 ${targets.length} 条匹配记录${hiddenCount ? `（含 ${hiddenCount} 条隐藏提示）` : ''}，可撤销，尚未保存到文件。`);
+}
 function jumpToPage(event) {
   event.preventDefault(); flushSource();
   const pages = Math.ceil(filteredRows().length / state.pageSize);
@@ -416,6 +460,7 @@ $('save-as').onclick = () => saveFile(true);
 $('add').onclick = addRecord; $('delete').onclick = deleteRecord; $('format').onclick = formatContent;
 $('delete-after').onclick = deleteAfter;
 $('delete-before').onclick = deleteBefore;
+$('delete-keywords').onclick = deleteKeywords;
 $('undo').onclick = () => history('undo'); $('redo').onclick = () => history('redo');
 for (const view of ['record', 'source']) {
   $(view + '-tab').onclick = () => {
@@ -497,21 +542,27 @@ if (document.modelContext?.registerTool) {
   }
 }
 async function api(path, body) {
-  const response = await fetch(path, {
+  const url = new URL(path, location.origin);
+  url.searchParams.set('provider', local.provider);
+  const response = await fetch(body ? path : url.pathname + url.search, {
     method: body ? 'POST' : 'GET',
     headers: { 'X-Chat-Sync-Token': local.token, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-    ...(body ? { body: JSON.stringify(body) } : {}),
+    ...(body ? { body: JSON.stringify({ provider: local.provider, ...body }) } : {}),
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  if (!response.ok) throw Object.assign(new Error(data.error || `HTTP ${response.status}`),
+    { status: response.status, code: data.code });
   return data;
 }
 function renderSyncInfo() {
   const info = state.sync?.info;
-  const labels = { aligned: '偏移一致', ahead: '索引超出文件', behind: '索引待更新', missing: '尚无索引' };
-  $('index-health').textContent = info ? labels[info.health] || info.health : '未关联 SQLite';
+  const labels = { aligned: '偏移一致', ahead: '索引超出文件', behind: '索引待更新', missing: '尚无索引', ready: 'JSONL 有效' };
+  $('index-health').textContent = info ? labels[info.health] || info.health :
+    local.provider === 'claude' ? '未选择会话' : '未关联 SQLite';
   $('index-health').className = 'health ' + (info?.health || '');
-  $('index-offset').textContent = info ? `${(info.projection?.next_rollout_byte_offset ?? 0).toLocaleString()} / ${info.fileBytes.toLocaleString()} B` : '';
+  $('index-offset').textContent = info ? local.provider === 'claude' ?
+    `${info.counts?.messages || 0} 条消息 · ${info.fileBytes.toLocaleString()} B` :
+    `${(info.projection?.next_rollout_byte_offset ?? 0).toLocaleString()} / ${info.fileBytes.toLocaleString()} B` : '';
   $('filename').title = info?.path || state.name;
   $('sync-bar').title = info?.metadata.id || '';
   $('open-parent').hidden = !info?.historyBase?.thread_id;
@@ -522,7 +573,8 @@ function renderSyncInfo() {
   $('copy-backup').title = state.sync?.backup || '复制最近一次备份路径';
 }
 function switchMode(mode) {
-  if (mode === 'sqlite' && !state.sync) return;
+  if (mode === 'sqlite' && (!state.sync || local.provider === 'claude')) return;
+  if (mode === 'recovery' && local.provider === 'claude') return;
   if (mode === 'ignored' && local.mode !== 'ignored') local.lastDataMode = local.mode;
   local.mode = mode;
   closeProjectMenu();
@@ -551,7 +603,9 @@ function messageButton(icon, label, action, className = '') {
 }
 async function backupCurrentSession() {
   if (!state.sync || state.busy) return;
-  if (!await confirmAction('备份当前会话？', '备份磁盘上的 JSONL、关联数据库和继承记录。未保存的编辑不在这次备份内；不会修改会话。', '创建备份')) return;
+  if (!await confirmAction('备份当前会话？', local.provider === 'claude' ?
+    '备份 Claude 会话 JSONL、已有项目索引和输入历史。未保存的编辑不在这次备份内；不会修改会话。' :
+    '备份磁盘上的 JSONL、关联数据库和继承记录。未保存的编辑不在这次备份内；不会修改会话。', '创建备份')) return;
   state.busy = true; renderStatus();
   try {
     const result = await api('/api/backup', { id: state.sync.id });
@@ -573,6 +627,7 @@ async function loadBackups() {
       const row = document.createElement('div'); row.className = 'backup-row';
       const details = document.createElement('div'); details.className = 'backup-details';
       const title = document.createElement('strong'); title.textContent = backup.title || backup.threadId;
+      title.title = title.textContent;
       const meta = document.createElement('span');
       const date = backup.createdAt && Number.isFinite(Date.parse(backup.createdAt)) ?
         new Date(backup.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : backup.backupId;
@@ -584,11 +639,33 @@ async function loadBackups() {
       const restore = messageButton('rotate-ccw', `恢复备份 ${backup.backupId}`, () => restoreBackup(backup));
       restore.dataset.backupId = backup.backupId; restore.dataset.unavailable = String(!backup.restorable);
       restore.disabled = state.busy || !backup.restorable;
-      row.append(details, location, restore); fragment.append(row);
+      const remove = messageButton('trash-2', backup.deletable ? `删除备份 ${title.textContent}` :
+        '此备份包含未完成的恢复记录，不能删除', () => deleteBackup(backup), 'danger');
+      remove.dataset.deleteBackupId = backup.backupId;
+      remove.dataset.unavailable = String(!backup.deletable);
+      remove.disabled = state.busy || !backup.deletable;
+      row.append(details, location, restore, remove); fragment.append(row);
     }
     if (!data.rows.length) { const empty = document.createElement('div'); empty.className = 'list-empty'; empty.textContent = '暂无备份'; fragment.append(empty); }
     $('backup-list').replaceChildren(fragment); icons();
-  } catch (error) { toast(`读取备份失败：${error.message}`); }
+    return true;
+  } catch (error) { toast(`读取备份失败：${error.message}`); return false; }
+}
+async function deleteBackup(backup) {
+  if (state.busy || !backup.deletable) return;
+  if (!await confirmAction('删除这个备份？',
+    `${backup.title || backup.threadId}\n\n仅删除这一个备份目录及其中的快照，不修改原会话或其他备份。删除后无法从本工具恢复。`, '删除备份')) return;
+  state.busy = true; local.backupRequest++; renderStatus();
+  try {
+    await api('/api/backups/delete', { backupId: backup.backupId });
+    if (state.sync?.backup === backup.backupPath) delete state.sync.backup;
+    for (const button of $('backup-list').querySelectorAll('[data-delete-backup-id]')) {
+      if (button.dataset.deleteBackupId === backup.backupId) button.closest('.backup-row')?.remove();
+    }
+    const refreshed = await loadBackups();
+    toast(refreshed ? '备份已删除，原会话未修改。' : '备份已删除，但列表刷新失败，请刷新备份列表。');
+  } catch (error) { toast(`删除备份失败：${error.message}`); }
+  finally { state.busy = false; renderStatus(); }
 }
 async function restoreBackup(backup) {
   if (state.busy) return;
@@ -597,7 +674,9 @@ async function restoreBackup(backup) {
     if (state.sync?.id !== backup.threadId) return;
   }
   if (dirty()) { toast('当前有未保存编辑，请先保存或重新读取后再恢复。'); return; }
-  if (!await confirmAction('恢复这条会话的历史？', '恢复备份的 JSONL 并重建该会话索引。恢复前会再次备份当前状态，不恢复其他会话。停止并关闭 Codex 中的目标会话后再操作。', '恢复备份')) return;
+  if (!await confirmAction('恢复这条会话的历史？', local.provider === 'claude' ?
+    '恢复所选 Claude 会话的 JSONL 并更新本地索引。恢复前会再次备份当前状态；请先退出 Claude Code。' :
+    '恢复备份的 JSONL 并重建该会话索引。恢复前会再次备份当前状态，不恢复其他会话。停止并关闭 Codex 中的目标会话后再操作。', '恢复备份')) return;
   state.busy = true; renderStatus();
   try {
     const result = await api('/api/restore', { id: state.sync.id, version: state.sync.version, backupId: backup.backupId });
@@ -687,12 +766,16 @@ function exportHandoff() {
 function currentTranscriptMessage(message) {
   if (state.busy || !finishDraft()) return null;
   renderConversation();
-  return transcript.messages.find((item) => item.key === message.key ||
-    (message.recordId && item.recordId === message.recordId && item.sourceThreadId === message.sourceThreadId)) || null;
+  return transcript.messages.find((item) => item.key === message.key) ||
+    transcript.messages.find((item) => message.recordId && item.recordId === message.recordId &&
+      item.sourceThreadId === message.sourceThreadId && item.sourcePath === message.sourcePath) || null;
 }
 async function startMessageEdit(message) {
   let current = currentTranscriptMessage(message);
   if (!current) return;
+  if (current.readOnly) {
+    toast('此消息属于只读历史分段，不能按当前文件的位置编辑。'); return;
+  }
   if (current.inherited && current.sourceThreadId !== state.sync?.id) {
     if (!await confirmAction('编辑父会话中的消息？',
       '此消息来自父会话。修改可能影响继承此段历史的分支，且不会自动修改分支的继承边界。继续打开父会话编辑？', '打开父会话')) return;
@@ -732,6 +815,15 @@ function cancelMessageEdit() {
 async function locateMessageSource(message) {
   let current = currentTranscriptMessage(message);
   if (!current) { if (!state.busy) toast('该消息已不在当前草稿中。'); return; }
+  if (current.readOnly) {
+    const source = state.sync?.inherited.find((item) => item.path === current.sourcePath);
+    const row = source?.rows?.[current.rowIndex];
+    if (!row) { toast('历史分段快照已失效，请重新读取聊天。'); return; }
+    $('history-source-title').textContent = `${current.sourcePath.split(/[\\/]/).pop()} · #${current.rowIndex + 1}`;
+    $('history-source-data').textContent = JSON.stringify(row.value, null, 2);
+    $('toast').hidden = true;
+    $('history-source-dialog').showModal(); return;
+  }
   if (current.sourceThreadId && current.sourceThreadId !== state.sync?.id) {
     const parentId = current.sourceThreadId, recordId = current.recordId, key = current.key;
     await openChat(parentId);
@@ -788,7 +880,7 @@ function hidePromptHoverSoon() {
 }
 function previewPrompt(message, anchor) {
   clearTimeout(promptHoverTimer); transcript.hover = message;
-  $('prompt-hover-meta').textContent = `第 ${message.promptNumber} 条发言 · ${message.inherited ? '父会话' : '原始数据'} #${message.rowIndex + 1}`;
+  $('prompt-hover-meta').textContent = `第 ${message.promptNumber} 条发言 · ${message.readOnly ? '历史分段' : message.inherited ? '父会话' : '原始数据'} #${message.rowIndex + 1}`;
   $('prompt-hover-text').textContent = message.text.slice(0, 180);
   const following = transcript.messages.slice(transcript.messages.indexOf(message) + 1);
   const reply = following[0]?.role === 'assistant' ? following[0] : null;
@@ -807,11 +899,15 @@ function renderConversation() {
   transcript.inheritedRef = state.sync?.inherited;
   const sources = (state.sync?.inherited || []).map((source) => {
     source.rows ||= splitSource(source.source);
-    return { id: source.id, rows: source.rows, inherited: true };
+    return { id: source.ownerId || source.id,
+      key: source.readOnly === true ? source.key || source.id : source.ownerId || source.id,
+      path: source.path, readOnly: source.readOnly === true, rows: source.rows, inherited: true };
   });
   sources.push({ id: state.sync?.id || '', rows: state.rows, inherited: false });
   transcript.messages = sources.flatMap((source) => window.ChatTranscript.readMessages(source.rows).map((message) => ({
-    ...message, key: source.id + '|' + message.key, sourceThreadId: source.id, inherited: source.inherited,
+    ...message, key: (source.key || source.id) + '|' + message.key,
+    sourceThreadId: source.id, sourcePath: source.path, readOnly: source.readOnly === true,
+    inherited: source.inherited,
   })));
   transcript.prompts = transcript.messages.filter((message) => message.role === 'user');
   transcript.prompts.forEach((message, index) => message.promptNumber = index + 1);
@@ -826,7 +922,7 @@ function renderConversation() {
     const meta = document.createElement('div'); meta.className = 'message-meta';
     const role = document.createElement('span'); role.textContent = message.role === 'user' ? '你' : '助手';
     meta.append(role);
-    if (message.inherited) { const inherited = document.createElement('span'); inherited.className = 'message-phase'; inherited.textContent = '继承'; meta.append(inherited); }
+    if (message.inherited) { const inherited = document.createElement('span'); inherited.className = 'message-phase'; inherited.textContent = message.readOnly ? '历史分段 · 只读' : '继承'; meta.append(inherited); }
     if (message.phase === 'commentary') { const phase = document.createElement('span'); phase.className = 'message-phase'; phase.textContent = '过程'; meta.append(phase); }
     if (message.timestamp && Number.isFinite(Date.parse(message.timestamp))) {
       const time = document.createElement('time'); time.dateTime = message.timestamp;
@@ -905,11 +1001,11 @@ async function refreshChats() {
     local.groups = data.groups;
     if (!local.groupsInitialized) {
       try {
-        const savedOrder = JSON.parse(localStorage.getItem('chat-sync-project-order'));
+        const savedOrder = JSON.parse(localStorage.getItem(providerStorageKey('chat-sync-project-order')));
         if (Array.isArray(savedOrder)) local.projectOrder = [...new Set(savedOrder.filter((key) => typeof key === 'string'))];
       } catch {}
       try {
-        const saved = JSON.parse(localStorage.getItem('chat-sync-ignored-projects'));
+        const saved = JSON.parse(localStorage.getItem(providerStorageKey('chat-sync-ignored-projects')));
         if (Array.isArray(saved)) for (const project of saved) {
           if (typeof project?.key === 'string' && typeof project.name === 'string') local.ignoredProjects.set(project.key, project);
         }
@@ -969,7 +1065,7 @@ function visibleProjectGroups() {
     (!local.searchScope || local.searchScope.key === group.key));
 }
 function persistIgnoredProjects() {
-  try { localStorage.setItem('chat-sync-ignored-projects', JSON.stringify([...local.ignoredProjects.values()])); }
+  try { localStorage.setItem(providerStorageKey('chat-sync-ignored-projects'), JSON.stringify([...local.ignoredProjects.values()])); }
   catch { toast('忽略状态已调整，但浏览器无法保存设置。'); }
 }
 function setProjectExpanded(group, expanded) {
@@ -1050,7 +1146,7 @@ function reorderProject(source, target, before) {
   const missing = local.projectOrder.filter((key) => !updated.includes(key));
   local.projectOrder = [...updated, ...missing];
   try {
-    localStorage.setItem('chat-sync-project-order', JSON.stringify(local.projectOrder));
+    localStorage.setItem(providerStorageKey('chat-sync-project-order'), JSON.stringify(local.projectOrder));
     toast('分组顺序已保存。');
   } catch { toast('顺序已调整，但浏览器无法保存排序设置。'); }
   renderChatTree();
@@ -1204,7 +1300,7 @@ async function openChat(id) {
   try {
     const data = await api('/api/open?' + new URLSearchParams({ id }));
     await readFile(new File([data.source], data.name), null,
-      { id, version: data.version, info: data.info, inherited: data.inherited || [] });
+      { id, provider: local.provider, version: data.version, info: data.info, inherited: data.inherited || [] });
     local.tableOffset = 0; local.row = null; $('db-row-detail').textContent = '未选择数据行';
     document.querySelectorAll('.chat-item').forEach((button) => button.classList.toggle('selected', button.dataset.threadId === id));
     if (innerWidth < 1050) $('chats-panel').classList.add('collapsed');
@@ -1213,11 +1309,16 @@ async function openChat(id) {
   finally { state.busy = false; renderStatus(); }
 }
 async function saveSynced(source) {
-  if (!await confirmAction('同步保存 JSONL 和 SQLite？',
+  const claude = local.provider === 'claude';
+  if (!await confirmAction(claude ? '保存 Claude Code 聊天？' : '同步保存 JSONL 和 SQLite？',
+    claude ? '将保存会话 JSONL、修复删除后的消息链及工具关联，并更新已有项目索引和匹配的输入历史。派生请求快照会清理，原数据自动备份。请先退出 Claude Code，正在运行或文件已变化时会拒绝写入。' :
     `将写入 ${state.name}，重新编号 ordinal，并重建这条聊天的 SQLite 索引。${$('mirror-messages').checked ? '同 ID 的单段文本消息副本和删除也会联动。' : ''}原文件和数据库将自动备份；Codex 正在使用该聊天或数据已发生变化时会拒绝写入。`, '同步保存')) return;
   state.busy = true; renderStatus();
+  const attempt = { id: state.sync.id, version: state.sync.version, source, provider: local.provider,
+    baselineSource: state.baseline, mirror: $('mirror-messages').checked };
   try {
-    const data = await api('/api/save', { id: state.sync.id, version: state.sync.version, source, mirror: $('mirror-messages').checked });
+    const data = await api('/api/save', { id: attempt.id, version: attempt.version,
+      source: attempt.source, mirror: attempt.mirror });
     state.sync.version = data.version; state.sync.info = data.info;
     state.sync.inherited = data.inherited || [];
     state.sync.backup = data.backup;
@@ -1225,7 +1326,30 @@ async function saveSynced(source) {
     state.baseline = data.source; state.draft = null;
     if (local.mode === 'sqlite') await loadTable();
     toast(`同步完成${data.linkedChanges ? `，联动 ${data.linkedChanges} 条记录` : ''}，原数据已备份。`);
-  } catch (error) { toast(`同步失败：${error.message}`); }
+  } catch (error) {
+    if (error.code !== 'writer_locked') {
+      toast(`同步失败：${error.message}`);
+    } else if (await confirmAction('同步失败，保存副本？',
+      `${claude ? 'Claude Code 仍在运行' : 'Codex 正在使用这条聊天'}，原会话尚未写入。将把本次编辑的完整草稿保存为新会话，保留用户、助手和工具记录，不修改原会话。原会话在读取后追加的内容不会包含在副本中。取消后保留当前草稿。`, '保存独立副本')) {
+      let created = null;
+      try {
+        created = await api('/api/copy', attempt);
+        const data = await api('/api/open?' + new URLSearchParams({ id: created.threadId }));
+        await readFile(new File([data.source], data.name), null,
+          { id: created.threadId, provider: local.provider, version: data.version, info: data.info,
+            inherited: data.inherited || [], backup: created.backupPath });
+        local.tableRequest++; local.tableOffset = 0; local.row = null;
+        $('db-row-detail').textContent = '未选择数据行';
+        await refreshChats();
+        toast('已保存独立编辑副本，原会话保持不变。' + (created.resumeCommand ? `继续命令：${created.resumeCommand}` : ''));
+      } catch (copyError) {
+        toast(created ? `副本已创建，但打开失败：${copyError.message}。副本 ID：${created.threadId}` :
+          `保存独立副本失败：${copyError.message}。当前草稿仍保留。`);
+      }
+    } else {
+      toast('已取消保存独立副本，当前草稿仍保留。');
+    }
+  }
   finally { state.busy = false; render(); }
 }
 function tableColumns(rows) {
@@ -1360,13 +1484,61 @@ $('locate-event').onclick = () => {
   state.selected = index; state.page = Math.floor(index / state.pageSize); state.view = 'record';
   switchMode('jsonl'); render();
 };
+function providerStorageKey(name) {
+  return local.provider === 'codex' ? name : `${name}:${local.provider}`;
+}
+async function changeProvider(provider, initial = false) {
+  const previous = local.provider;
+  if (state.busy || (!initial && provider === previous)) {
+    $('provider-select').value = previous; return;
+  }
+  if (!initial && !await allowReplace()) {
+    $('provider-select').value = previous; return;
+  }
+  if (!local.providers.some(item => item.id === provider && item.available)) {
+    $('provider-select').value = previous; toast('尚未检测到该来源的本地聊天记录。'); return;
+  }
+  clearTimeout(inputTimer); clearTimeout(chatSearchTimer);
+  if (local.projectDrag) endProjectDrag();
+  local.provider = provider;
+  $('toast').hidden = true;
+  $('provider-select').value = provider;
+  $('provider-title').textContent = provider === 'claude' ? 'Claude' : 'Codex';
+  try { localStorage.setItem('chat-sync-provider', provider); } catch {}
+  Object.assign(state, { opened: false, name: '', handle: null, source: '', baseline: '', selected: -1,
+    rows: [], view: 'record', page: 0, draft: null, undo: [], redo: [], sync: null, typeFilter: '', busy: true });
+  state.checked.clear();
+  transcript.source = null; transcript.inheritedRef = null; transcript.edit = null;
+  transcript.expanded.clear(); transcript.active = '';
+  local.chatRequest++; local.tableRequest++; local.backupRequest++;
+  local.groups = []; local.groupsInitialized = false; local.projectOrder = [];
+  local.ignoredProjects.clear(); local.expanded.clear(); local.searchCollapsed.clear();
+  local.projectLimits.clear(); local.loadingProjects.clear(); local.searchScope = null;
+  local.sidebarQuery = ''; local.recoveryPlan = null; local.recoveryDraft = null;
+  local.tableOffset = 0; local.row = null;
+  $('chat-search').value = ''; $('search').value = ''; $('prompt-search').value = '';
+  $('db-row-detail').textContent = '未选择数据行';
+  switchMode('conversation'); render(); renderChatTree();
+  try { await refreshChats(); }
+  finally { state.busy = false; render(); renderChatTree(); }
+}
+$('provider-select').onchange = () => changeProvider($('provider-select').value);
 async function bootstrap() {
   try {
     const data = await (await fetch('/api/bootstrap')).json();
     if (!data.token) throw new Error(data.error || '本地服务不可用');
     local.token = data.token; $('connection-label').textContent = '本机连接';
     $('connection-label').title = data.databases.join('\n');
-    await refreshChats();
+    local.providers = data.providers || [{ id: 'codex', label: 'Codex', available: true }];
+    $('provider-select').replaceChildren(...local.providers.map(provider => {
+      const option = new Option(provider.label + (provider.available ? '' : '（未检测到）'), provider.id);
+      option.disabled = !provider.available; return option;
+    }));
+    let preferred;
+    try { preferred = localStorage.getItem('chat-sync-provider'); } catch {}
+    const selected = local.providers.find(p => p.id === preferred && p.available)?.id ||
+      data.defaultProvider || 'codex';
+    await changeProvider(selected, true);
   } catch (error) { $('connection-label').textContent = '连接失败'; toast(error.message); }
 }
 const narrowConversation = window.matchMedia('(max-width: 849px)');

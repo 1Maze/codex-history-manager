@@ -14,7 +14,7 @@
 </head>
 <body>
   <header class="app-header">
-    <div class="brand"><span class="brand-icon"><i data-lucide="database"></i></span><h1>Codex <span>聊天工作台</span></h1></div>
+    <div class="brand"><span class="brand-icon"><i data-lucide="database"></i></span><h1><b id="provider-title">Codex</b> <span>聊天工作台</span></h1></div>
     <div class="local-label"><i data-lucide="hard-drive"></i><span id="connection-label">连接本机...</span></div>
     <button id="toggle-chats" class="icon-button" title="显示或隐藏聊天列表" aria-label="显示或隐藏聊天列表"><i data-lucide="panel-left"></i></button>
     <button id="open" class="button" title="打开普通 JSONL 文件（不关联 SQLite）"><i data-lucide="folder-open"></i><span>打开文件</span></button>
@@ -39,12 +39,14 @@
     <div class="sync-controls"><span id="index-health" class="health">未选择聊天</span>
     <span id="index-offset" class="index-offset"></span>
     <label class="linked-toggle" title="保存时联动同 ID 的单段文本消息副本及删除；不改其他事件"><input id="mirror-messages" type="checkbox" checked><span>关联消息</span></label>
+    <button id="delete-keywords" class="icon-button danger" title="删除 safeguards / cyber 记录及隐藏的 safety classifier 历史提示" aria-label="删除关键词记录及隐藏拦截提示" disabled><i data-lucide="eraser"></i></button>
     <button id="reload-chat" class="icon-button" title="重新读取聊天和 SQLite" aria-label="重新读取聊天和 SQLite" disabled><i data-lucide="refresh-cw"></i></button>
     <button id="repair-index" class="icon-button" title="按当前磁盘 JSONL 重建索引" aria-label="按当前磁盘 JSONL 重建索引" disabled><i data-lucide="wrench"></i></button>
     </div>
   </div>
   <div class="workspace">
   <aside id="chats-panel" class="chats-panel">
+    <label class="provider-switch"><span>来源</span><select id="provider-select" aria-label="聊天来源"><option value="codex">Codex</option><option value="claude">Claude Code</option></select></label>
     <div class="panel-heading"><h2>项目</h2><span id="chat-total" class="count">0</span><div class="project-controls"><button id="expand-all-projects" class="icon-button" title="展开全部项目" aria-label="展开全部项目"><i data-lucide="chevrons-up-down"></i></button><button id="collapse-all-projects" class="icon-button" title="收起全部项目" aria-label="收起全部项目"><i data-lucide="chevrons-down-up"></i></button><button id="refresh-chats" class="icon-button" title="刷新项目和聊天" aria-label="刷新项目和聊天"><i data-lucide="refresh-cw"></i></button></div></div>
     <label class="search"><i data-lucide="search"></i><input id="chat-search" placeholder="标题、ID、项目..." aria-label="搜索聊天"></label>
     <div id="project-search-scope" class="project-search-scope" hidden><i data-lucide="folder-search"></i><span id="project-search-name"></span><button id="clear-project-scope" class="icon-button" title="退出项目内搜索" aria-label="退出项目内搜索"><i data-lucide="x"></i></button></div>
@@ -131,5 +133,6 @@
   </div>
   <div id="prompt-hover" class="prompt-hover" role="dialog" aria-label="发言预览" hidden><div id="prompt-hover-meta"></div><p id="prompt-hover-text"></p><blockquote id="prompt-hover-reply" hidden></blockquote><div class="prompt-hover-actions"><button id="prompt-hover-jump" class="icon-button" title="跳转到这条发言" aria-label="跳转到这条发言"><i data-lucide="arrow-down"></i></button><button id="prompt-hover-source" class="icon-button" title="定位这条发言的原始数据" aria-label="定位这条发言的原始数据"><i data-lucide="file-code-2"></i></button></div></div>
   <dialog id="confirm-dialog"><form method="dialog"><h2 id="dialog-title"></h2><p id="dialog-message"></p><div class="dialog-actions"><button class="button" value="cancel">取消</button><button id="dialog-confirm" class="button primary" value="confirm">继续</button></div></form></dialog>
+  <dialog id="history-source-dialog"><form method="dialog" class="history-source-heading"><h2 id="history-source-title"></h2><button class="icon-button" title="关闭历史数据" aria-label="关闭历史数据"><i data-lucide="x"></i></button></form><pre id="history-source-data"></pre></dialog>
 </body>
 </html>

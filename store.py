@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -21,12 +22,18 @@ HISTORY_TABLES = (
     "thread_turns", "thread_items", "thread_realtime_items",
     "thread_history_projection_state",
 )
+UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+ROLLOUT_IDENTITY = re.compile(
+    r"^rollout-(?:.*-)?(" + UUID_PATTERN + r")(?:_(" + UUID_PATTERN + r"))?\.jsonl$", re.I)
+MAX_HISTORY_BYTES = 180 * 1024 * 1024
+MAX_HISTORY_SEGMENTS = 1024
 
 
 class StoreError(Exception):
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, code=None):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -317,13 +324,17 @@ class ChatStore:
             row = db.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if row is None:
             raise StoreError("聊天不存在。", 404)
-        path = Path(row["rollout_path"]).expanduser().resolve()
+        path = self.rollout_path(row["rollout_path"])
+        return dict(row), path
+
+    def rollout_path(self, value):
+        path = Path(value).expanduser().resolve()
         if not any(path.is_relative_to((self.home / directory).resolve())
                    for directory in ("sessions", "archived_sessions")):
             raise StoreError("聊天记录不在当前 Codex 的 sessions 目录内。")
         if not path.is_file():
             raise StoreError("聊天记录文件不存在。", 404)
-        return dict(row), path
+        return path
 
     def threads(self, query="", offset=0, limit=60):
         with connect(self.state_db, True) as db:
@@ -388,64 +399,141 @@ class ChatStore:
             group["nextOffset"] = len(group["threads"])
         return {"groups": ordered, "total": total}
 
-    def history_rows(self, thread_id, db=None):
+    def history_id(self, thread_id, path=None):
+        if path is None:
+            with connect(self.state_db, True) as db:
+                row = db.execute("SELECT rollout_path FROM threads WHERE id=?", (thread_id,)).fetchone()
+            path = Path(row["rollout_path"]).expanduser().resolve() if row else None
+        identity = ROLLOUT_IDENTITY.fullmatch(Path(path).name) if path else None
+        return (identity[2] or identity[1]).lower() if identity else thread_id
+
+    def history_rows(self, thread_id, db=None, path=None):
         if db is None:
             with connect(self.history_db, True) as connection:
-                return self.history_rows(thread_id, connection)
+                return self.history_rows(thread_id, connection, path)
+        history_id = self.history_id(thread_id, path)
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         return {
             table: [dict(row) for row in db.execute(
-                f'SELECT * FROM "{table}" WHERE thread_id=? ORDER BY rowid', (thread_id,))]
+                f'SELECT * FROM "{table}" WHERE thread_id=? ORDER BY rowid', (history_id,))]
             for table in HISTORY_TABLES if table in tables
         }
 
-    def database_fingerprint(self, thread_id, db=None):
-        return fingerprint(encode(self.history_rows(thread_id, db)).encode("utf-8"))
+    def database_fingerprint(self, thread_id, db=None, path=None):
+        return fingerprint(encode(self.history_rows(thread_id, db, path)).encode("utf-8"))
 
-    def lineage(self, thread_id):
-        _, path = self.thread(thread_id)
-        with path.open("rb") as handle:
-            meta = json.loads(handle.readline())["payload"]
-        visited = {thread_id}
+    def segment_paths(self):
+        """Filename suffixes identify rollouts, not the logical owner in session_meta."""
+        index = {}
+        for directory in ("sessions", "archived_sessions"):
+            for candidate in (self.home / directory).rglob("rollout-*.jsonl"):
+                identity = ROLLOUT_IDENTITY.fullmatch(candidate.name)
+                if identity:
+                    identifier = (identity[2] or identity[1]).lower()
+                    index.setdefault(identifier, set()).add(candidate.resolve())
+        return index
+
+    def history_path(self, identifier, index):
+        if not isinstance(identifier, str) or not re.fullmatch(UUID_PATTERN, identifier, re.I):
+            raise StoreError("历史分段引用 ID 无效。", 409)
+        candidates = index.get(identifier.lower(), set())
+        if len(candidates) > 1:
+            raise StoreError(f"历史分段 {identifier} 对应多个文件，不能自动选择。", 409)
+        if candidates:
+            path = self.rollout_path(next(iter(candidates)))
+            identity = ROLLOUT_IDENTITY.fullmatch(path.name)
+            if not identity or (identity[2] or identity[1]).lower() != identifier.lower():
+                raise StoreError("历史分段文件标识与引用不一致。", 409)
+            return path
+        # A legacy arbitrary filename can still be located through its actual thread row.
+        with connect(self.state_db, True) as db:
+            row = db.execute("SELECT rollout_path FROM threads WHERE id=?", (identifier,)).fetchone()
+        if row:
+            path = self.rollout_path(row["rollout_path"])
+            if not ROLLOUT_IDENTITY.fullmatch(path.name):
+                return path
+        raise StoreError(f"历史分段文件不存在：{identifier}。", 404)
+
+    def lineage(self, thread_id, *, path=None, meta=None):
+        if path is None:
+            _, path = self.thread(thread_id)
+        else:
+            path = Path(path).resolve()
+        if meta is None:
+            with path.open("rb") as handle:
+                meta = json.loads(handle.readline())["payload"]
+        visited = {path}
         parents = []
+        index, metadata_cache, total = None, {}, 0
         while meta.get("history_base"):
             base = meta["history_base"]
+            if not isinstance(base, dict):
+                raise StoreError("历史分段继承信息无效。", 409)
             parent_id = base.get("thread_id")
-            if parent_id in visited or len(parents) >= 16:
-                raise StoreError("聊天继承链存在循环或超过 16 层。")
-            visited.add(parent_id)
-            _, parent_path = self.thread(parent_id)
-            raw = parent_path.read_bytes()
-            end = base.get("end_byte_offset", len(raw))
-            if type(end) is not int or end < 0 or end > len(raw):
-                raise StoreError("父聊天记录已缩短，当前分支的继承边界失效。", 409)
-            meta = json.loads(raw.split(b"\n", 1)[0])["payload"]
+            if len(parents) >= MAX_HISTORY_SEGMENTS:
+                raise StoreError(f"历史分段超过 {MAX_HISTORY_SEGMENTS} 层，超出本地解析上限。")
+            if index is None:
+                index = self.segment_paths()
+            parent_path = self.history_path(parent_id, index)
+            if parent_path in visited:
+                raise StoreError(f"聊天历史文件的继承引用存在循环：{parent_path.name}。", 409)
+            visited.add(parent_path)
+            with parent_path.open("rb") as handle:
+                meta = json.loads(handle.readline())["payload"]
+                size = handle.seek(0, os.SEEK_END)
+                end = base.get("end_byte_offset", size)
+                if type(end) is not int or end < 0 or end > size:
+                    raise StoreError("父聊天记录已缩短，当前分支的继承边界失效。", 409)
+                total += end
+                if total > MAX_HISTORY_BYTES:
+                    raise StoreError("继承历史超过 180 MiB，超出本地编辑器上限。")
+                handle.seek(0)
+                raw = handle.read(end)
+            if len(raw) != end:
+                raise StoreError("历史分段在读取期间发生变化，请重试。", 409)
+            if end and end < size and not raw.endswith(b"\n"):
+                raise StoreError("历史分段的继承边界不是完整记录边界。", 409)
+            identity = ROLLOUT_IDENTITY.fullmatch(parent_path.name)
+            owner_id = meta.get("id")
+            expected_owner = identity[1] if identity else parent_id
+            if not isinstance(owner_id, str) or owner_id.lower() != expected_owner.lower():
+                raise StoreError("历史分段的会话 ID 与文件标识不一致。", 409)
+            if owner_id not in metadata_cache:
+                with connect(self.state_db, True) as db:
+                    row = db.execute("SELECT * FROM threads WHERE id=?", (owner_id,)).fetchone()
+                metadata_cache[owner_id] = dict(row) if row else None
+            parent_metadata = metadata_cache[owner_id]
             parents.append({"id": parent_id, "path": parent_path, "data": raw,
-                            "prefixHash": fingerprint(raw[:end]), "end": end})
+                            "ownerId": owner_id, "metadata": parent_metadata,
+                            "readOnly": parent_metadata is None or
+                            Path(parent_metadata["rollout_path"]).expanduser().resolve() != parent_path,
+                            "prefixHash": fingerprint(raw), "end": end})
         return parents
 
-    def lineage_fingerprint(self, thread_id):
+    def lineage_fingerprint(self, thread_id, **options):
         return fingerprint(encode([
             {"id": p["id"], "path": str(p["path"]), "prefixHash": p["prefixHash"], "end": p["end"]}
-            for p in self.lineage(thread_id)
+            for p in self.lineage(thread_id, **options)
         ]).encode())
 
-    def inspect(self, thread_id):
-        metadata, path = self.thread(thread_id)
+    def inspect(self, thread_id, metadata=None, path=None):
+        if path is None:
+            metadata, path = self.thread(thread_id)
+        history_id = self.history_id(thread_id, path)
         with connect(self.history_db, True) as db:
             projection = db.execute(
                 "SELECT * FROM thread_history_projection_state WHERE thread_id=?",
-                (thread_id,)).fetchone()
+                (history_id,)).fetchone()
             counts = {}
             for table in HISTORY_TABLES:
                 counts[table] = db.execute(
-                    f'SELECT count(*) FROM "{table}" WHERE thread_id=?', (thread_id,)).fetchone()[0]
+                    f'SELECT count(*) FROM "{table}" WHERE thread_id=?', (history_id,)).fetchone()[0]
         size = path.stat().st_size
         offset = projection["next_rollout_byte_offset"] if projection else None
         with path.open("rb") as handle:
             history_base = json.loads(handle.readline()).get("payload", {}).get("history_base")
         return {
-            "metadata": metadata, "path": str(path), "fileBytes": size,
+            "metadata": metadata, "path": str(path), "fileBytes": size, "historyId": history_id,
             "projection": dict(projection) if projection else None, "counts": counts,
             "health": "missing" if offset is None else
                       "ahead" if offset > size else "behind" if offset < size else "aligned",
@@ -465,41 +553,45 @@ class ChatStore:
                 raise StoreError("文件不是有效 UTF-8。")
             inherited = []
             total_bytes = len(raw)
-            for parent in reversed(self.lineage(thread_id)):
+            for parent in reversed(self.lineage(thread_id, path=path)):
                 data = parent["data"][:parent["end"]]
                 total_bytes += len(data)
                 if total_bytes > 180 * 1024 * 1024:
                     raise StoreError("会话及继承记录合计超过 180 MiB 上限。")
-                parent_metadata, _ = self.thread(parent["id"])
+                parent_metadata = parent["metadata"] or {}
                 inherited.append({"id": parent["id"],
-                                  "name": parent_metadata.get("name") or parent_metadata["title"],
+                                  "ownerId": parent["ownerId"], "path": str(parent["path"]),
+                                  "key": str(parent["path"]), "readOnly": parent["readOnly"],
+                                  "name": parent_metadata.get("name") or parent_metadata.get("title") or
+                                          parent["ownerId"],
                                   "source": data.decode("utf-8", errors="strict")})
             token = uuid.uuid4().hex
             self.snapshots[token] = {
                 "threadId": thread_id, "path": str(path),
                 "fileHash": fingerprint(raw),
-                "historyHash": self.database_fingerprint(thread_id),
+                "historyHash": self.database_fingerprint(thread_id, path=path),
                 "metadataHash": fingerprint(encode(metadata).encode()),
-                "lineageHash": self.lineage_fingerprint(thread_id),
+                "lineageHash": self.lineage_fingerprint(thread_id, path=path),
             }
             if len(self.snapshots) > 100:
                 self.snapshots.pop(next(iter(self.snapshots)))
             return {"source": source, "inherited": inherited, "version": token, "name": path.name,
-                    "info": self.inspect(thread_id)}
+                    "info": self.inspect(thread_id, metadata, path)}
 
     def table(self, thread_id, table, offset=0, limit=30):
         if table not in ("threads",) + HISTORY_TABLES:
             raise StoreError("只允许读取聊天相关数据表。")
-        self.thread(thread_id)
+        _, path = self.thread(thread_id)
         target = self.state_db if table == "threads" else self.history_db
         key = "id" if table == "threads" else "thread_id"
+        identifier = thread_id if table == "threads" else self.history_id(thread_id, path)
         with connect(target, True) as db:
             columns = [dict(row) for row in db.execute(f'PRAGMA table_info("{table}")')]
             count = db.execute(f'SELECT count(*) FROM "{table}" WHERE "{key}"=?',
-                               (thread_id,)).fetchone()[0]
+                               (identifier,)).fetchone()[0]
             rows = [dict(row) for row in db.execute(
                 f'SELECT * FROM "{table}" WHERE "{key}"=? ORDER BY rowid LIMIT ? OFFSET ?',
-                (thread_id, limit, offset))]
+                (identifier, limit, offset))]
         return {"table": table, "columns": columns, "rows": rows, "total": count,
                 "offset": offset, "limit": limit}
 
@@ -548,27 +640,32 @@ class ChatStore:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise StoreError("Codex 正在使用这条聊天，请停止运行并关闭该聊天后再保存。", 409)
+                raise StoreError("Codex 正在使用这条聊天，请停止运行并关闭该聊天后再保存。", 409,
+                                 code="writer_locked")
             try:
                 yield
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
-    def build_projection(self, thread_id, data):
+    def build_projection(self, thread_id, data, source_path=None):
         with tempfile.TemporaryDirectory(prefix="codex-chat-verify-") as temporary:
             home = Path(temporary)
             backup_database(self.state_db, home / "state_5.sqlite")
             backup_database(self.history_db, home / "thread_history_1.sqlite")
-            _, original_path = self.thread(thread_id)
+            if source_path is None:
+                _, original_path = self.thread(thread_id)
+            else:
+                original_path = self.rollout_path(source_path)
             path = home / "sessions" / original_path.name
             path.parent.mkdir()
             path.write_bytes(data)
-            parents = self.lineage(thread_id)
+            parents = self.lineage(thread_id, path=original_path,
+                                   meta=json.loads(data.split(b"\n", 1)[0])["payload"])
             staged_paths = {thread_id: path}
             for parent in parents:
                 destination = path.parent / parent["path"].name
                 destination.write_bytes(parent["data"])
-                staged_paths[parent["id"]] = destination
+                staged_paths.setdefault(parent["ownerId"], destination)
             with connect(home / "state_5.sqlite") as db:
                 db.execute("DELETE FROM threads WHERE id NOT IN (" +
                            ",".join("?" for _ in staged_paths) + ")", list(staged_paths))
@@ -580,7 +677,7 @@ class ChatStore:
                     db.execute(f'DELETE FROM "{table}"')
             self.parser.project(home, thread_id)
             with connect(home / "thread_history_1.sqlite", True) as db:
-                projected = self.history_rows(thread_id, db)
+                projected = self.history_rows(thread_id, db, path=path)
                 columns = {
                     table: [r["name"] for r in db.execute(f'PRAGMA table_info("{table}")')]
                     for table in projected
@@ -616,6 +713,7 @@ class ChatStore:
             linked_count = 0
             with self.writer_lock(thread_id):
                 metadata, path = self.thread(thread_id)
+                history_id = self.history_id(thread_id, path)
                 original = path.read_bytes()
                 self.check_baseline(thread_id, baseline, metadata, path, original)
                 original_meta = json.loads(original.split(b"\n", 1)[0])["payload"]
@@ -626,7 +724,7 @@ class ChatStore:
                     linked_source, linked_count = linked_messages(
                         data.decode("utf-8"), original.decode("utf-8"))
                     data, count = self.normalize(linked_source, thread_id)
-                projected, columns = self.build_projection(thread_id, data)
+                projected, columns = self.build_projection(thread_id, data, source_path=path)
                 # Native projection runs only on the isolated copy. Recheck live inputs before commit.
                 metadata, path = self.thread(thread_id)
                 original = path.read_bytes()
@@ -651,7 +749,7 @@ class ChatStore:
                         self.check_baseline(thread_id, baseline, current_meta, current_path,
                                             current_path.read_bytes(), check_history=False)
                         for table in HISTORY_TABLES:
-                            db.execute(f'DELETE FROM "{table}" WHERE thread_id=?', (thread_id,))
+                            db.execute(f'DELETE FROM "{table}" WHERE thread_id=?', (history_id,))
                         for table, rows in projected.items():
                             names = columns[table]
                             placeholders = ",".join("?" for _ in names)

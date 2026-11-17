@@ -37,7 +37,16 @@ with tempfile.TemporaryDirectory(prefix="chat-sync-browser-") as temporary:
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     const errors = []; page.on('pageerror', (error) => errors.push(error.message));
-    await page.goto(url);
+    await page.route('https://history-navigation.test/', (route) => route.fulfill({
+      contentType: 'text/html; charset=utf-8',
+      body: `<a href="${url}/">打开聊天工作台</a>`,
+    }));
+    await page.goto('https://history-navigation.test/');
+    const [navigation] = await Promise.all([
+      page.waitForResponse(response => response.url() === url + '/'),
+      page.getByRole('link', { name: '打开聊天工作台' }).click(),
+    ]);
+    assert.equal(navigation.status(), 200);
     await page.waitForSelector('.project-toggle');
     assert.equal(await page.locator('.project-group').count(), 1);
     assert.equal(await page.locator('.chat-item').count(), 0);
@@ -128,7 +137,7 @@ with tempfile.TemporaryDirectory(prefix="chat-sync-browser-") as temporary:
     const rebinding = await page.request.get(url + '/api/bootstrap', { headers: { Host: 'attacker.invalid' } });
     assert.equal(rebinding.status(), 403);
     assert.deepEqual(errors, []);
-    console.log('PASS: project grouping, title-only rows, folder collapse/search, native synchronization, SQLite row navigation, linked edits, deletion, undo/redo, desktop/mobile, security.');
+    console.log('PASS: external-link navigation, project grouping, title-only rows, folder collapse/search, native synchronization, SQLite row navigation, linked edits, deletion, undo/redo, desktop/mobile, security.');
   } finally {
     await browser.close();
     python.kill('SIGTERM');
